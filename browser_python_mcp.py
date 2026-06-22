@@ -1,33 +1,16 @@
-"""Browser Use MCP — automação de browser + mapeamento de sites.
+"""Polaris MCP — Browser automation with Map First architecture.
 
-Arquitetura Map First → Execute → Verify:
+Map First philosophy: always orient before you navigate.
+Polaris maps any website completely before writing a single line of automation —
+discovering selectors, API calls, hidden elements, and storage state, so the AI
+acts with full knowledge instead of trial-and-error.
 
-  CONHECIMENTO
-    browser_map_site          crawla o site, retorna selector_index completo
-    browser_explore_page      inspeção profunda de 1 página (elementos ocultos)
-    browser_intercept_network captura requisições XHR/fetch durante navegação
-    browser_accessibility_tree árvore ARIA — funciona em qualquer site
-
-  EXECUÇÃO
-    browser_run_playwright    executa código Playwright gerado pela IA
-    browser_execute_sequence  executa sequência tipada de ações (JSON)
-    browser_run_task          fallback LLM para tarefas não-estruturadas
-
-  VERIFICAÇÃO
-    browser_diff_pages        diff estruturado entre dois estados de página
-    browser_capture_console   captura console do browser (erros, logs)
-    browser_get_storage       lê localStorage, sessionStorage, cookies
-
-  AUTENTICAÇÃO
-    browser_login             login pontual, salva sessão em arquivo
-    browser_session_save      login nomeado persistente
-    browser_session_check     valida se sessão ainda é ativa
-    browser_session_list      lista todas as sessões salvas
-
-  UTILITÁRIOS
-    browser_screenshot        screenshot como base64 PNG
-    browser_get_page_content  texto visível da página
-    browser_get_help          documentação completa
+Architecture layers:
+  KNOWLEDGE   → map_site, explore_page, intercept_network, accessibility_tree
+  EXECUTION   → run_playwright, execute_sequence, run_task
+  VERIFICATION → diff_pages, capture_console, get_storage
+  AUTH         → login, session_save, session_check, session_list
+  UTILITIES    → screenshot, get_page_content, get_help
 """
 from __future__ import annotations
 
@@ -49,7 +32,7 @@ from browser_use.llm.openai.chat import ChatOpenAI
 from mcp.server.fastmcp import FastMCP
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
-# ── configuração ──────────────────────────────────────────────────────────────
+# ── configuration ─────────────────────────────────────────────────────────────
 
 MCP_HOST = os.getenv("MCP_HOST", "127.0.0.1")
 MCP_PORT = int(os.getenv("MCP_PORT", "8016"))
@@ -59,23 +42,149 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 DEFAULT_MODEL = os.getenv("BROWSER_USE_MODEL", "gpt-4o-mini")
 HEADLESS = os.getenv("BROWSER_HEADLESS", "true").lower() not in ("false", "0", "no")
-SESSIONS_DIR = os.getenv("BROWSER_MCP_SESSIONS_DIR", "/tmp/browser_mcp_sessions")
+SESSIONS_DIR = os.getenv("POLARIS_SESSIONS_DIR", "/tmp/polaris_sessions")
 
 logging.basicConfig(level=logging.WARNING)
-logger = logging.getLogger("browser-mcp")
+logger = logging.getLogger("polaris-mcp")
 
-mcp = FastMCP("BrowserUsePythonLocal", host=MCP_HOST, port=MCP_PORT)
+_INSTRUCTIONS = """
+You are connected to Polaris MCP — a browser automation server built on the Map First philosophy.
+
+CORE PRINCIPLE: Always map a site before automating it. Call browser_map_site first to get the
+complete selector inventory, then use browser_explore_page to discover hidden elements, then
+browser_intercept_network to understand the API layer. Only after that should you write automation.
+
+════════════════════════════════════════════════════════════════
+ LAYER 1 — KNOWLEDGE  (always start here)
+════════════════════════════════════════════════════════════════
+
+browser_map_site(url, session_file, max_pages, wait_seconds, follow_links)
+  BFS crawl of the entire site. Returns a JSON map with:
+  • data_qa_elements per page — tag, count, visible texts
+  • forms and inputs — id, name, type, placeholder
+  • internal navigation links discovered
+  • interactive_triggers (buttons, tabs, dropdowns)
+  • selector_index — cross-page index of all [data-qa] attributes
+  USE: Before writing any automation on a new site or page.
+
+browser_explore_page(url, session_file, trigger_interactions, max_triggers, wait_seconds)
+  Deep inspection of a single page. Clicks each interactive trigger and records
+  which new [data-qa] elements appear — revealing dropdowns, modals, tabs, and
+  context menus that are invisible in the static snapshot.
+  USE: When map_site shows a trigger but you need to know what it reveals.
+
+browser_intercept_network(url, session_file, actions_code, resource_types, filter_url_contains)
+  Captures all XHR/fetch requests during page load and optional actions.
+  Returns: method, URL, status, request body, response body (truncated).
+  USE: To discover API endpoints the frontend calls — map the API layer automatically.
+
+browser_accessibility_tree(url, session_file, interesting_only, max_depth)
+  Extracts the full ARIA accessibility tree. Works on any site regardless of
+  data-qa conventions. Returns flat + nested tree with roles and names.
+  USE: On sites without data-qa, or to navigate by semantic meaning.
+
+════════════════════════════════════════════════════════════════
+ LAYER 2 — EXECUTION  (after you know the selectors)
+════════════════════════════════════════════════════════════════
+
+browser_run_playwright(code, session_file, start_url, timeout_seconds)
+  Executes Python Playwright code directly — no LLM in the loop.
+  The code receives `page`, `context`, `asyncio`. Use `return {...}` to return data.
+  USE: For precise, deterministic automation with selectors from the map.
+
+browser_execute_sequence(steps_json, session_file, start_url, stop_on_error)
+  Runs a typed JSON action sequence. Each step: {action, ...params}.
+  Actions: goto · click · fill · select · press · hover · scroll ·
+           wait_for · snapshot · screenshot · evaluate
+  USE: Safer than run_playwright for predictable linear flows.
+
+browser_run_task(task, start_url, model, max_steps, sensitive_data, session_file)
+  LLM-driven automation in natural language (browser-use agent).
+  USE: Fallback for unstructured exploration when selectors are not yet known.
+
+════════════════════════════════════════════════════════════════
+ LAYER 3 — VERIFICATION  (confirm what happened)
+════════════════════════════════════════════════════════════════
+
+browser_diff_pages(url_a, url_b, actions_code, session_file, wait_seconds)
+  Structural diff between two page states.
+  Returns: added_qa · removed_qa · changed_texts · changed_counts.
+  Modes: compare two URLs, or before/after an action on the same URL.
+  USE: To assert that an action produced the expected UI change.
+
+browser_capture_console(url, session_file, actions_code, levels)
+  Captures browser console output (log, warn, error, pageerror) during navigation.
+  USE: To diagnose silent frontend failures — errors always appear here first.
+
+browser_get_storage(url, session_file, wait_seconds)
+  Reads localStorage, sessionStorage, and cookies for a URL.
+  USE: To inspect auth tokens, SPA state, cached preferences.
+
+════════════════════════════════════════════════════════════════
+ AUTHENTICATION
+════════════════════════════════════════════════════════════════
+
+browser_login(login_url, username_value, password_value, session_file, ...)
+  One-off login via Playwright. Saves session to a file path you specify.
+
+browser_session_save(name, login_url, username_value, password_value, ...)
+  Named login — saves session to POLARIS_SESSIONS_DIR/{name}.json.
+  Preferred over browser_login for reusable sessions.
+
+browser_session_check(name, check_url, login_redirect_patterns)
+  Verifies a named session is still active (not expired or redirected to login).
+  Call before using a session that may have aged out.
+
+browser_session_list()
+  Lists all saved named sessions with metadata and last-valid status.
+
+════════════════════════════════════════════════════════════════
+ UTILITIES
+════════════════════════════════════════════════════════════════
+
+browser_screenshot(url, session_file, wait_seconds, full_page)
+  Returns a base64 PNG screenshot.
+
+browser_get_page_content(url, session_file, wait_seconds)
+  Returns visible page text (no HTML), truncated at 20,000 characters.
+
+browser_get_help()
+  Returns this documentation as a string.
+
+════════════════════════════════════════════════════════════════
+ RECOMMENDED WORKFLOW FOR A NEW SITE
+════════════════════════════════════════════════════════════════
+
+1. browser_session_save("myapp", "https://app.com/login", "user", "pass")
+2. browser_map_site("https://app.com", session_file=".../myapp.json")
+   → read selector_index to know every [data-qa] and where it lives
+3. browser_explore_page("https://app.com/dashboard", trigger_interactions=True)
+   → discover what dropdowns and modals are hidden behind triggers
+4. browser_intercept_network("https://app.com/dashboard", ...)
+   → map every API endpoint the page calls
+5. browser_execute_sequence('[{"action":"click","selector":"[data-qa=X]"}]', ...)
+   → act with precision using real selectors
+6. browser_diff_pages("https://app.com/dashboard", actions_code="...")
+   → confirm the UI changed as expected
+"""
+
+mcp = FastMCP(
+    "Polaris",
+    host=MCP_HOST,
+    port=MCP_PORT,
+    instructions=_INSTRUCTIONS,
+)
 
 
-# ── helpers internos ──────────────────────────────────────────────────────────
+# ── internal helpers ──────────────────────────────────────────────────────────
 
 def _get_llm(model: str):
     if model.startswith("claude"):
         if not ANTHROPIC_API_KEY:
-            raise RuntimeError("ANTHROPIC_API_KEY não configurado")
+            raise RuntimeError("ANTHROPIC_API_KEY is not set")
         return ChatAnthropic(model=model, api_key=ANTHROPIC_API_KEY)
     if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY não configurado")
+        raise RuntimeError("OPENAI_API_KEY is not set")
     return ChatOpenAI(model=model, api_key=OPENAI_API_KEY)
 
 
@@ -99,7 +208,7 @@ async def _make_context(p, session_file: Optional[str]) -> tuple[Browser, Browse
 
 
 async def _exec_actions_code(page: Page, ctx: BrowserContext, code: str) -> None:
-    """Executa código de ações inline (parâmetro actions_code)."""
+    """Wraps and executes an actions_code string inside an async function."""
     cleaned = textwrap.dedent(code.rstrip())
     indented = "\n".join(f"    {line}" for line in cleaned.splitlines())
     fn_src = f"async def _actions(page, context, asyncio):\n{indented}\n"
@@ -108,7 +217,7 @@ async def _exec_actions_code(page: Page, ctx: BrowserContext, code: str) -> None
     await ns["_actions"](page, ctx, asyncio)
 
 
-# JavaScript que extrai inventário completo de uma página
+# JavaScript that extracts a complete page inventory
 _INVENTORY_JS = """
 () => {
     const qaMap = {};
@@ -214,26 +323,28 @@ async def browser_login(
     username_selector: str = "input[type=email],input[name=username],#username",
     password_selector: str = "input[type=password],input[name=password],#password",
     submit_selector: str = "input[type=submit],button[type=submit],#kc-login",
-    session_file: str = "/tmp/browser_mcp_session.json",
+    session_file: str = "/tmp/polaris_session.json",
     wait_after_login: float = 5.0,
 ) -> str:
-    """Faz login em um site via Playwright e salva a sessão para uso posterior.
+    """Log in to a site via Playwright and save the session for later use.
 
-    Recomendado para sites com OAuth/SSO. Após login, passe session_file para
-    browser_run_playwright, browser_map_site ou browser_run_task.
+    Recommended for OAuth/SSO sites where redirect flows make login tricky.
+    After logging in, pass session_file to any tool that accepts it.
+
+    For reusable named sessions prefer browser_session_save instead.
 
     Args:
-        login_url: URL da página de login.
-        username_value: E-mail ou usuário.
-        password_value: Senha.
-        username_selector: CSS selector do campo de usuário (vírgula = candidatos).
-        password_selector: CSS selector do campo de senha.
-        submit_selector: CSS selector do botão de submit.
-        session_file: Onde salvar cookies/storage.
-        wait_after_login: Segundos de espera após submit.
+        login_url: URL of the login page.
+        username_value: Username or email to enter.
+        password_value: Password to enter.
+        username_selector: CSS selector(s) for the username field (comma = candidates).
+        password_selector: CSS selector(s) for the password field.
+        submit_selector: CSS selector(s) for the submit button.
+        session_file: Path to save cookies and storage state.
+        wait_after_login: Seconds to wait after submit before saving the session.
 
     Returns:
-        URL final, título e caminho do arquivo de sessão.
+        Final URL, page title, and session file path.
     """
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=HEADLESS)
@@ -271,7 +382,7 @@ async def browser_login(
         await ctx.storage_state(path=session_file)
         await browser.close()
 
-    return f"Login concluído. URL={final_url} | Título={title} | Sessão={session_file}"
+    return f"Login complete. url={final_url} | title={title} | session={session_file}"
 
 
 # ── browser_map_site ──────────────────────────────────────────────────────────
@@ -284,23 +395,29 @@ async def browser_map_site(
     wait_seconds: float = 5.0,
     follow_links: bool = True,
 ) -> str:
-    """Mapeia um site inteiro via crawl BFS e retorna mapa mental estruturado em JSON.
+    """Crawl a site via BFS and return a complete structured mental map as JSON.
 
-    Para cada página extrai: data-qa elements (tag, count, textos), forms/inputs,
-    links internos, botões sem data-qa e triggers interativos.
-    Retorna também selector_index cruzado com todos os data-qa encontrados no site.
+    For each page the map includes:
+    • data_qa_elements — every [data-qa] with tag, count, and visible texts
+    • forms — all inputs with id, name, type, placeholder, required
+    • navigation_links — internal links discovered (used for BFS)
+    • buttons_no_qa — visible button text for elements without data-qa
+    • interactive_triggers — elements likely to open dropdowns/modals/tabs
 
-    Use ANTES de escrever qualquer automação para conhecer os seletores reais.
+    The top-level selector_index cross-references every [data-qa] attribute
+    found across the entire site with total counts and which pages it appears on.
+
+    Call this BEFORE writing any automation on a new site.
 
     Args:
-        url: URL de início do mapeamento.
-        session_file: Sessão para sites autenticados (gerada por browser_login).
-        max_pages: Limite de páginas a mapear via BFS (padrão: 10).
-        wait_seconds: Espera após carregar cada página (padrão: 5.0).
-        follow_links: Se False, mapeia só a URL inicial.
+        url: Entry point URL for the crawl.
+        session_file: Session file from browser_login or browser_session_save.
+        max_pages: Maximum pages to crawl via BFS (default: 10).
+        wait_seconds: Seconds to wait after loading each page (default: 5.0).
+        follow_links: If False, maps only the entry URL without following links.
 
     Returns:
-        JSON com { base_url, pages_mapped, pages, selector_index }
+        JSON: { base_url, pages_mapped, pages: [...], selector_index: {...} }
     """
     parsed = urlparse(url)
     base_origin = f"{parsed.scheme}://{parsed.hostname}"
@@ -324,7 +441,7 @@ async def browser_map_site(
                 await asyncio.sleep(wait_seconds)
 
                 if urlparse(page.url).hostname != parsed.hostname:
-                    logger.warning("Redirecionado para fora do domínio: %s", page.url)
+                    logger.warning("Redirected off-domain to %s — stopping crawl.", page.url)
                     break
 
                 snap = await _snapshot(page)
@@ -337,7 +454,7 @@ async def browser_map_site(
                             queue.append(full)
 
             except Exception as e:
-                logger.warning("Erro ao mapear %s: %s", current, e)
+                logger.warning("Error mapping %s: %s", current, e)
 
         await browser.close()
 
@@ -360,21 +477,24 @@ async def browser_explore_page(
     max_triggers: int = 8,
     wait_seconds: float = 5.0,
 ) -> str:
-    """Inspeção profunda de uma página, incluindo elementos visíveis só após interações.
+    """Deep-inspect a single page, including elements only visible after interactions.
 
-    Captura estado estático e depois (se trigger_interactions=True) clica em cada
-    trigger interativo, registra quais novos [data-qa] aparecem (dropdowns, modais,
-    tabs) e fecha antes de testar o próximo.
+    Takes a static snapshot first, then (if trigger_interactions=True) clicks each
+    interactive trigger, records which new [data-qa] elements appear, and closes
+    the trigger before testing the next one.
+
+    This reveals dropdowns, context menus, modals, and tab panels that are invisible
+    in the static DOM — giving you the complete selector set for a page.
 
     Args:
-        url: Página a inspecionar.
-        session_file: Sessão para autenticação.
-        trigger_interactions: Se True, clica em triggers para revelar hidden elements.
-        max_triggers: Máx triggers a testar (padrão: 8).
-        wait_seconds: Espera após carregar (padrão: 5.0).
+        url: Page to inspect.
+        session_file: Session file for authenticated sites.
+        trigger_interactions: Click triggers to reveal hidden elements (default: True).
+        max_triggers: Maximum triggers to test per page (default: 8).
+        wait_seconds: Seconds to wait after loading (default: 5.0).
 
     Returns:
-        JSON com { static_elements, revealed_after_interactions, total_revealed_qa }
+        JSON: { static_elements, revealed_after_interactions: [{trigger_qa, new_elements}] }
     """
     async with async_playwright() as p:
         browser, ctx = await _make_context(p, session_file)
@@ -417,7 +537,7 @@ async def browser_explore_page(
                     await page.keyboard.press("Escape")
                     await asyncio.sleep(0.8)
                 except Exception as e:
-                    logger.debug("Trigger '%s' falhou: %s", qa, e)
+                    logger.debug("Trigger '%s' failed: %s", qa, e)
                     try:
                         await page.keyboard.press("Escape")
                     except Exception:
@@ -447,23 +567,25 @@ async def browser_intercept_network(
     filter_url_contains: Optional[str] = None,
     max_body_chars: int = 2000,
 ) -> str:
-    """Navega para uma URL, executa ações opcionais e captura todas as requisições de rede.
+    """Capture all network requests made during page load and optional actions.
 
-    Intercepta XHR/fetch em tempo real, revelando quais endpoints o frontend chama,
-    com payloads de request e response. Ideal para mapear a API automaticamente.
+    Intercepts XHR/fetch in real time — revealing which endpoints the frontend
+    calls, with full request and response payloads. Use this to automatically
+    discover and document the API layer of any web application.
 
     Args:
-        url: URL inicial.
-        session_file: Sessão para autenticação.
-        actions_code: Código Python async (com `page`) a executar após carregar.
-                      Use para disparar ações e capturar as chamadas resultantes.
-        wait_seconds: Espera após carregar a página (padrão: 5.0).
-        resource_types: Tipos a capturar, vírgula-separados (padrão: "fetch,xhr").
-        filter_url_contains: Filtra entradas cuja URL contém esta string (opcional).
-        max_body_chars: Trunca bodies de request/response (padrão: 2000).
+        url: Starting URL.
+        session_file: Session file for authenticated sites.
+        actions_code: Optional async Python code (receives `page`) to execute after
+                      the page loads. Use this to trigger user actions and capture
+                      the resulting API calls.
+        wait_seconds: Seconds to wait after page load (default: 5.0).
+        resource_types: Comma-separated resource types to capture (default: "fetch,xhr").
+        filter_url_contains: Only capture requests whose URL contains this string.
+        max_body_chars: Truncate request/response bodies at this length (default: 2000).
 
     Returns:
-        JSON com { requests_captured, entries: [{method, url, status, request_body, response_body}] }
+        JSON: { requests_captured, entries: [{method, url, status, request_body, response_body}] }
     """
     target_types = {t.strip() for t in resource_types.split(",")}
     entries: list[dict] = []
@@ -522,7 +644,7 @@ async def browser_intercept_network(
         if actions_code:
             await _exec_actions_code(page, ctx, actions_code)
 
-        await asyncio.sleep(1.5)  # aguarda requests pendentes
+        await asyncio.sleep(1.5)
         await browser.close()
 
     return json.dumps({
@@ -542,20 +664,21 @@ async def browser_capture_console(
     wait_seconds: float = 5.0,
     levels: str = "log,warn,error,info",
 ) -> str:
-    """Navega para uma URL e captura todo output do console do browser.
+    """Capture all browser console output during page load and optional actions.
 
-    Captura console.log/warn/error/info e erros de página (uncaught exceptions).
-    Essencial para diagnosticar falhas silenciosas no frontend.
+    Collects console.log / warn / error / info messages and uncaught page errors.
+    When something fails silently in the UI, the root cause is almost always visible
+    here first.
 
     Args:
-        url: URL inicial.
-        session_file: Sessão para autenticação.
-        actions_code: Código Python async a executar após carregar (para disparar ações).
-        wait_seconds: Espera após carregar (padrão: 5.0).
-        levels: Níveis a capturar, vírgula-separados (padrão: "log,warn,error,info").
+        url: Starting URL.
+        session_file: Session file for authenticated sites.
+        actions_code: Optional async Python code to execute after load (receives `page`).
+        wait_seconds: Seconds to wait after page load (default: 5.0).
+        levels: Comma-separated console levels to capture (default: "log,warn,error,info").
 
     Returns:
-        JSON com { errors, warnings, info, all_messages }
+        JSON: { errors, warnings, info, all_messages, messages_captured }
     """
     target_levels = {lv.strip() for lv in levels.split(",")}
     messages: list[dict] = []
@@ -599,7 +722,7 @@ async def browser_capture_console(
     }, ensure_ascii=False, indent=2)
 
 
-# ── browser_session_save / check / list ───────────────────────────────────────
+# ── session manager ───────────────────────────────────────────────────────────
 
 @mcp.tool()
 async def browser_session_save(
@@ -612,21 +735,25 @@ async def browser_session_save(
     submit_selector: str = "input[type=submit],button[type=submit],#kc-login",
     wait_after_login: float = 5.0,
 ) -> str:
-    """Faz login e salva a sessão com um nome amigável para reutilização.
+    """Log in and save the session under a friendly name for later reuse.
 
-    Cria dois arquivos em BROWSER_MCP_SESSIONS_DIR (padrão: /tmp/browser_mcp_sessions):
-    - {name}.json  → storage state do Playwright
-    - {name}.meta.json → metadados (usuário, url, timestamps)
+    Creates two files in POLARIS_SESSIONS_DIR (default: /tmp/polaris_sessions):
+    • {name}.json       — Playwright storage state (cookies + localStorage)
+    • {name}.meta.json  — metadata (username, login URL, timestamps)
+
+    Pass the session file path from browser_session_list to any tool that
+    accepts session_file.
 
     Args:
-        name: Nome da sessão (ex: "leandro", "front_qa", "admin").
-        login_url: URL da página de login.
-        username_value / password_value: Credenciais.
+        name: Friendly session name (e.g. "admin", "qa-user", "read-only").
+        login_url: URL of the login page.
+        username_value: Username or email.
+        password_value: Password.
         username_selector / password_selector / submit_selector: CSS selectors.
-        wait_after_login: Segundos de espera após submit.
+        wait_after_login: Seconds to wait after submit.
 
     Returns:
-        Confirmação com caminho do arquivo de sessão salvo.
+        Confirmation with session file path.
     """
     os.makedirs(SESSIONS_DIR, exist_ok=True)
     session_file = os.path.join(SESSIONS_DIR, f"{name}.json")
@@ -655,7 +782,7 @@ async def browser_session_save(
     with open(meta_file, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
-    return f"Sessão '{name}' salva. {login_result}"
+    return f"Session '{name}' saved. {login_result}"
 
 
 @mcp.tool()
@@ -664,23 +791,28 @@ async def browser_session_check(
     check_url: str,
     login_redirect_patterns: str = "login,auth,keycloak,signin,sso",
 ) -> str:
-    """Verifica se uma sessão nomeada ainda é válida (não redirecionou para login).
+    """Verify that a named session is still active (not expired or redirected to login).
+
+    Navigates to check_url with the saved session. If the final URL contains any
+    of the redirect patterns, the session is considered expired.
 
     Args:
-        name: Nome da sessão (gerada por browser_session_save).
-        check_url: URL protegida a tentar acessar.
-        login_redirect_patterns: Padrões na URL que indicam redirecionamento para login.
+        name: Session name (created by browser_session_save).
+        check_url: A protected URL that requires authentication.
+        login_redirect_patterns: Comma-separated URL substrings that indicate a
+                                 redirect to the login page.
 
     Returns:
-        JSON com { name, valid, final_url, reason }
+        JSON: { name, valid, final_url, reason, session_file }
     """
     session_file = os.path.join(SESSIONS_DIR, f"{name}.json")
     meta_file = os.path.join(SESSIONS_DIR, f"{name}.meta.json")
 
     if not os.path.exists(session_file):
         return json.dumps({
-            "name": name, "valid": False,
-            "reason": f"Sessão '{name}' não encontrada em {SESSIONS_DIR}",
+            "name": name,
+            "valid": False,
+            "reason": f"Session '{name}' not found in {SESSIONS_DIR}",
         })
 
     patterns = [pt.strip() for pt in login_redirect_patterns.split(",")]
@@ -709,16 +841,16 @@ async def browser_session_check(
         "valid": valid,
         "final_url": final_url,
         "session_file": session_file,
-        "reason": "Redirecionou para login" if redirected else "Sessão ativa",
+        "reason": "Redirected to login — session expired" if redirected else "Session is active",
     }, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
 def browser_session_list() -> str:
-    """Lista todas as sessões salvas com seus metadados e status de validade.
+    """List all saved named sessions with their metadata and last-known validity.
 
     Returns:
-        JSON com { sessions: [...], count }
+        JSON: { sessions: [{name, username, login_url, created_at, last_valid, ...}], count }
     """
     if not os.path.exists(SESSIONS_DIR):
         return json.dumps({"sessions": [], "count": 0})
@@ -748,21 +880,27 @@ async def browser_diff_pages(
     session_file: Optional[str] = None,
     wait_seconds: float = 5.0,
 ) -> str:
-    """Compara dois estados de página e retorna diff estruturado de elementos.
+    """Compare two page states and return a structured diff of UI elements.
 
-    Dois modos:
-    - url_b fornecida: compara dois URLs diferentes.
-    - actions_code fornecido: compara url_a antes e depois de executar as ações.
+    Two modes:
+    • url_b provided   — compares two different URLs side by side.
+    • actions_code provided — compares url_a before and after the actions run.
+
+    The diff reports:
+    • added_qa     — [data-qa] elements that appeared in state B
+    • removed_qa   — [data-qa] elements that disappeared from state A
+    • changed_texts  — elements whose visible text changed
+    • changed_counts — elements whose count changed (e.g. a list grew)
 
     Args:
-        url_a: Primeira URL (estado inicial).
-        url_b: Segunda URL (opcional — comparação entre páginas distintas).
-        actions_code: Código a executar para transitar do estado A para B (opcional).
-        session_file: Sessão para autenticação.
-        wait_seconds: Espera após carregar cada estado.
+        url_a: First URL (initial state).
+        url_b: Second URL for cross-page comparison (optional).
+        actions_code: Async Python code to transition from state A to B (optional).
+        session_file: Session file for authenticated sites.
+        wait_seconds: Seconds to wait after loading each state.
 
     Returns:
-        JSON com { added_qa, removed_qa, changed_texts, changed_counts, summary }
+        JSON: { added_qa, removed_qa, changed_texts, changed_counts, summary }
     """
     async with async_playwright() as p:
         browser, ctx = await _make_context(p, session_file)
@@ -826,20 +964,22 @@ async def browser_accessibility_tree(
     interesting_only: bool = True,
     max_depth: int = 6,
 ) -> str:
-    """Extrai a árvore de acessibilidade (ARIA) de uma página.
+    """Extract the ARIA accessibility tree of a page.
 
-    Funciona em qualquer site, independente de data-qa. Retorna roles e names
-    semânticos que permitem navegação por significado, não por seletor técnico.
+    Works on any site regardless of data-qa conventions. Returns semantic roles
+    and names that let you navigate by meaning rather than by CSS selector.
+    Particularly useful for sites built with standard HTML semantics or
+    accessible component libraries.
 
     Args:
-        url: Página a inspecionar.
-        session_file: Sessão para autenticação.
-        wait_seconds: Espera após carregar (padrão: 5.0).
-        interesting_only: Se True, filtra nós sem nome/role (padrão: True).
-        max_depth: Profundidade máxima da árvore na versão flat (padrão: 6).
+        url: Page to inspect.
+        session_file: Session file for authenticated sites.
+        wait_seconds: Seconds to wait after loading (default: 5.0).
+        interesting_only: Filter out nodes with no role or name (default: True).
+        max_depth: Maximum tree depth in the flat representation (default: 6).
 
     Returns:
-        JSON com { node_count, flat: [{depth, role, name, ...}], tree }
+        JSON: { node_count, flat: [{depth, role, name, value, ...}], tree }
     """
     async with async_playwright() as p:
         browser, ctx = await _make_context(p, session_file)
@@ -887,39 +1027,43 @@ async def browser_execute_sequence(
     start_url: Optional[str] = None,
     stop_on_error: bool = True,
 ) -> str:
-    """Executa uma sequência tipada de ações no browser definida como JSON.
+    """Execute a typed JSON action sequence in the browser.
 
-    Mais seguro que browser_run_playwright para fluxos previsíveis: cada ação tem
-    tipo declarado, tratamento de erro embutido e resultado por passo.
+    Safer than browser_run_playwright for predictable linear flows: each action
+    has a declared type, built-in error handling, and a per-step result record.
 
-    Ações disponíveis e seus campos:
+    Available actions and their required fields:
       { "action": "goto",       "url": "https://..." }
-      { "action": "click",      "selector": "[data-qa=X]", "force": false, "wait_after": 1.0 }
-      { "action": "fill",       "selector": "#input", "value": "texto" }
-      { "action": "select",     "selector": "select", "value": "opcao" }
+      { "action": "click",      "selector": "[data-qa=X]", "force": false,
+                                "index": 0, "wait_after": 1.0, "timeout": 10000 }
+      { "action": "fill",       "selector": "#email", "value": "text",
+                                "timeout": 10000 }
+      { "action": "select",     "selector": "select", "value": "option" }
       { "action": "press",      "key": "Enter" }
       { "action": "hover",      "selector": "[data-qa=X]" }
       { "action": "scroll",     "x": 0, "y": 500 }
-      { "action": "wait_for",   "selector": "[data-qa=X]", "timeout": 8000 }
-      { "action": "wait_for",   "text": "Salvo com sucesso", "timeout": 5000 }
+      { "action": "wait_for",   "selector": "[data-qa=X]", "state": "visible",
+                                "timeout": 10000 }
+      { "action": "wait_for",   "text": "Success", "timeout": 5000 }
       { "action": "wait_for",   "seconds": 2 }
       { "action": "snapshot" }
       { "action": "screenshot", "full_page": false }
       { "action": "evaluate",   "expression": "document.title" }
 
     Args:
-        steps_json: JSON array de steps (ver ações acima).
-        session_file: Sessão para autenticação.
-        start_url: URL inicial antes da sequência (opcional).
-        stop_on_error: Se True, para na primeira falha (padrão: True).
+        steps_json: JSON array of step objects (see actions above).
+        session_file: Session file for authenticated sites.
+        start_url: URL to navigate to before running the sequence.
+        stop_on_error: Stop on the first failed step (default: True).
 
     Returns:
-        JSON com { steps_total, steps_succeeded, final_url, results: [{step, action, success, result, error}] }
+        JSON: { steps_total, steps_succeeded, final_url,
+                results: [{step, action, success, result, error}] }
     """
     try:
         steps: list[dict] = json.loads(steps_json)
     except json.JSONDecodeError as e:
-        return json.dumps({"success": False, "error": f"JSON inválido em steps_json: {e}"})
+        return json.dumps({"success": False, "error": f"Invalid JSON in steps_json: {e}"})
 
     results: list[dict] = []
 
@@ -988,14 +1132,16 @@ async def browser_execute_sequence(
                         tmp = f.name
                     await page.screenshot(path=tmp, full_page=step.get("full_page", False))
                     with open(tmp, "rb") as f:
-                        sr["result"] = f"data:image/png;base64,{base64.b64encode(f.read()).decode()}"
+                        sr["result"] = (
+                            f"data:image/png;base64,{base64.b64encode(f.read()).decode()}"
+                        )
                     os.unlink(tmp)
 
                 elif action == "evaluate":
                     sr["result"] = await page.evaluate(step["expression"])
 
                 else:
-                    raise ValueError(f"Ação desconhecida: '{action}'")
+                    raise ValueError(f"Unknown action: '{action}'")
 
                 sr["success"] = True
 
@@ -1028,17 +1174,18 @@ async def browser_get_storage(
     session_file: Optional[str] = None,
     wait_seconds: float = 3.0,
 ) -> str:
-    """Lê localStorage, sessionStorage e cookies de uma URL.
+    """Read localStorage, sessionStorage, and cookies for a URL.
 
-    Útil para inspecionar tokens de auth, estado persistido da SPA e preferências.
+    Useful for inspecting auth tokens, persisted SPA state, feature flags,
+    and any data the application stores in the browser between sessions.
 
     Args:
-        url: URL a inspecionar.
-        session_file: Sessão para autenticação.
-        wait_seconds: Espera após carregar (padrão: 3.0).
+        url: Page to inspect.
+        session_file: Session file for authenticated sites.
+        wait_seconds: Seconds to wait after loading (default: 3.0).
 
     Returns:
-        JSON com { local_storage, session_storage, cookies, *_keys }
+        JSON: { local_storage, session_storage, cookies, *_keys, cookies_count }
     """
     async with async_playwright() as p:
         browser, ctx = await _make_context(p, session_file)
@@ -1081,25 +1228,28 @@ async def browser_run_playwright(
     start_url: Optional[str] = None,
     timeout_seconds: int = 60,
 ) -> str:
-    """Executa código Python Playwright diretamente, sem LLM intermediário.
+    """Execute Python Playwright code directly — no LLM in the automation loop.
 
-    O código recebe `page`, `context` e `asyncio` já configurados.
-    Escreva o corpo de uma função async — use `return` para retornar dados.
-    Recomendado: use seletores obtidos via browser_map_site ou browser_explore_page.
+    The code body receives `page` (Playwright Page), `context` (BrowserContext),
+    and `asyncio`. Write it as the body of an async function. Use `return` to
+    return structured data back to the caller.
 
-    Exemplo:
+    Always use selectors discovered via browser_map_site or browser_explore_page
+    rather than guessing.
+
+    Example:
+        count = await page.locator('[data-qa="ItemCard"]').count()
         title = await page.title()
-        count = await page.locator('[data-qa="Item"]').count()
-        return {"title": title, "count": count}
+        return {"title": title, "item_count": count}
 
     Args:
-        code: Corpo async com acesso a `page`, `context`, `asyncio`.
-        session_file: Sessão para autenticação.
-        start_url: URL inicial antes de executar o código.
-        timeout_seconds: Timeout total (padrão: 60s).
+        code: Async function body with access to `page`, `context`, `asyncio`.
+        session_file: Session file for authenticated sites.
+        start_url: URL to navigate to before running the code.
+        timeout_seconds: Total execution timeout in seconds (default: 60).
 
     Returns:
-        JSON com { success, result, final_url, error }
+        JSON: { success, result, final_url, error }
     """
     cleaned = textwrap.dedent(code.rstrip())
     indented = "\n".join(f"    {line}" for line in cleaned.splitlines())
@@ -1127,8 +1277,10 @@ async def browser_run_playwright(
             output = {"success": True, "result": result, "final_url": page.url, "error": None}
 
         except asyncio.TimeoutError:
-            output = {"success": False, "result": None,
-                      "error": f"Timeout após {timeout_seconds}s"}
+            output = {
+                "success": False, "result": None,
+                "error": f"Execution timed out after {timeout_seconds}s",
+            }
         except Exception as e:
             output = {"success": False, "result": None, "final_url": page.url, "error": str(e)}
         finally:
@@ -1148,26 +1300,28 @@ async def browser_run_task(
     sensitive_data: Optional[dict] = None,
     session_file: Optional[str] = None,
 ) -> str:
-    """Executa uma tarefa de automação em linguagem natural via LLM (browser-use).
+    """Execute a natural-language automation task using an LLM agent (browser-use).
 
-    Prefira browser_run_playwright ou browser_execute_sequence para tarefas
-    com seletores conhecidos. Use esta tool para exploração inicial ou quando
-    os seletores ainda não foram mapeados.
+    This is the unstructured fallback — use it for initial exploration when selectors
+    are not yet known. For anything requiring precision or repeatability, prefer
+    browser_run_playwright or browser_execute_sequence with selectors from browser_map_site.
 
     Args:
-        task: Descrição da tarefa. Use {placeholder} para dados sensíveis.
-        start_url: URL inicial (opcional).
-        model: LLM a usar (padrão: gpt-4o-mini). Use "claude-sonnet-4-6" para Claude.
-        max_steps: Número máximo de ações (padrão: 30).
-        sensitive_data: {"email": "...", "password": "..."} — não exposto ao LLM.
-        session_file: Arquivo de sessão do browser_login.
+        task: Natural language description of what to do.
+              Use {placeholder} syntax to reference keys in sensitive_data.
+        start_url: URL to navigate to before executing the task.
+        model: LLM model ID (default: gpt-4o-mini). Prefix with "claude-" for Anthropic.
+        max_steps: Maximum agent action steps (default: 30).
+        sensitive_data: Dict of sensitive values not exposed to the LLM internally.
+                        Example: {"email": "user@x.com", "password": "secret"}.
+        session_file: Session file for authenticated sites.
 
     Returns:
-        Resultado final da tarefa como texto.
+        Final task result as plain text.
     """
     use_model = model or DEFAULT_MODEL
     llm = _get_llm(use_model)
-    full_task = f"Navegue para {start_url}. Em seguida: {task}" if start_url else task
+    full_task = f"Navigate to {start_url}. Then: {task}" if start_url else task
     profile = _make_profile(HEADLESS, storage_state=session_file)
 
     agent = Agent(
@@ -1184,8 +1338,8 @@ async def browser_run_task(
     history = result.action_results()
     if history:
         last = history[-1]
-        return str(last.extracted_content or last.error or "Tarefa concluída sem resultado.")
-    return "Tarefa concluída sem resultado."
+        return str(last.extracted_content or last.error or "Task completed with no output.")
+    return "Task completed with no output."
 
 
 # ── browser_screenshot ────────────────────────────────────────────────────────
@@ -1197,16 +1351,16 @@ async def browser_screenshot(
     wait_seconds: float = 3.0,
     full_page: bool = False,
 ) -> str:
-    """Tira um screenshot de uma URL e retorna como base64 PNG.
+    """Capture a screenshot of a URL and return it as a base64 PNG.
 
     Args:
-        url: URL a capturar.
-        session_file: Sessão para autenticação.
-        wait_seconds: Espera após carregar (padrão: 3.0).
-        full_page: Se True, captura a página inteira (padrão: False = viewport).
+        url: URL to capture.
+        session_file: Session file for authenticated sites.
+        wait_seconds: Seconds to wait after loading (default: 3.0).
+        full_page: If True, captures the full scrollable page (default: False = viewport only).
 
     Returns:
-        String base64 no formato data:image/png;base64,...
+        Base64-encoded PNG as data:image/png;base64,...
     """
     async with async_playwright() as p:
         browser, ctx = await _make_context(p, session_file)
@@ -1232,15 +1386,15 @@ async def browser_get_page_content(
     session_file: Optional[str] = None,
     wait_seconds: float = 3.0,
 ) -> str:
-    """Carrega uma URL e retorna o texto visível da página (sem HTML), máx 20.000 chars.
+    """Load a URL and return its visible text content (no HTML), up to 20,000 characters.
 
     Args:
-        url: URL a carregar.
-        session_file: Sessão para autenticação.
-        wait_seconds: Espera após carregar (padrão: 3.0).
+        url: URL to load.
+        session_file: Session file for authenticated sites.
+        wait_seconds: Seconds to wait after loading (default: 3.0).
 
     Returns:
-        Texto visível da página, truncado em 20.000 caracteres.
+        Visible page text, truncated at 20,000 characters.
     """
     async with async_playwright() as p:
         browser, ctx = await _make_context(p, session_file)
@@ -1263,85 +1417,8 @@ async def browser_get_page_content(
 
 @mcp.tool()
 def browser_get_help() -> str:
-    """Retorna documentação completa das ferramentas do Browser Use MCP."""
-    return """
-# Browser Use MCP — Documentação
-
-## Arquitetura Map First → Execute → Verify
-
-### CONHECIMENTO (antes de automatizar)
-  browser_map_site(url, session_file, max_pages)
-    → crawla o site, retorna selector_index com todos os [data-qa] por página
-
-  browser_explore_page(url, session_file, trigger_interactions=True)
-    → inspeção profunda: clica em triggers para revelar dropdowns/modais/tabs
-
-  browser_intercept_network(url, session_file, actions_code)
-    → captura XHR/fetch durante navegação: endpoints, payloads, respostas
-
-  browser_accessibility_tree(url, session_file)
-    → árvore ARIA semântica — funciona em qualquer site sem data-qa
-
-### EXECUÇÃO (com seletores conhecidos)
-  browser_run_playwright(code, session_file, start_url)
-    → executa Python Playwright diretamente (sem LLM no loop)
-    → `return {...}` captura resultado estruturado
-
-  browser_execute_sequence(steps_json, session_file, start_url)
-    → sequência tipada: goto/click/fill/select/press/hover/scroll/
-                        wait_for/snapshot/screenshot/evaluate
-
-  browser_run_task(task, start_url, model, session_file)
-    → fallback LLM (browser-use) para exploração inicial
-
-### VERIFICAÇÃO (confirmar que funcionou)
-  browser_diff_pages(url_a, url_b=None, actions_code=None, session_file)
-    → diff: added_qa, removed_qa, changed_texts, changed_counts
-
-  browser_capture_console(url, session_file, actions_code)
-    → captura errors, warnings, logs do console do browser
-
-  browser_get_storage(url, session_file)
-    → localStorage, sessionStorage, cookies
-
-### AUTENTICAÇÃO
-  browser_login(login_url, username, password, session_file)
-    → login pontual, salva em arquivo
-
-  browser_session_save(name, login_url, username, password)
-    → salva sessão nomeada em /tmp/browser_mcp_sessions/
-
-  browser_session_check(name, check_url)
-    → verifica se sessão ainda é válida
-
-  browser_session_list()
-    → lista todas as sessões salvas e seus status
-
-### UTILITÁRIOS
-  browser_screenshot(url, session_file, full_page)
-  browser_get_page_content(url, session_file)
-
-## Fluxo típico para novo site
-
-1. browser_session_save("minha_conta", "https://site.com/login", "user", "pass")
-2. browser_map_site("https://site.com", session_file="/tmp/browser_mcp_sessions/minha_conta.json")
-   → selector_index revela todos os [data-qa]
-3. browser_explore_page("https://site.com/dashboard", ...)
-   → descobre elementos em dropdowns/modais
-4. browser_intercept_network("https://site.com/dashboard", ...)
-   → mapeia API endpoints usados pela página
-5. browser_execute_sequence('[{"action":"click","selector":"[data-qa=AddButton]"}]', ...)
-   → executa a ação
-6. browser_diff_pages("https://site.com/dashboard", actions_code="...")
-   → confirma que o elemento foi adicionado
-
-## Configuração via variáveis de ambiente
-  BROWSER_USE_MODEL          modelo LLM padrão (default: gpt-4o-mini)
-  BROWSER_HEADLESS           true/false (default: true)
-  BROWSER_MCP_SESSIONS_DIR   diretório de sessões (default: /tmp/browser_mcp_sessions)
-  OPENAI_API_KEY / ANTHROPIC_API_KEY
-  MCP_HOST, MCP_PORT, MCP_TRANSPORT
-"""
+    """Return full Polaris MCP documentation as a string."""
+    return _INSTRUCTIONS
 
 
 if __name__ == "__main__":
