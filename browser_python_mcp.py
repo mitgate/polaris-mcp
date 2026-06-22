@@ -21,6 +21,7 @@ import logging
 import os
 import tempfile
 import textwrap
+import time as _time
 from datetime import datetime
 from typing import Optional
 from urllib.parse import urljoin, urlparse
@@ -43,6 +44,8 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 DEFAULT_MODEL = os.getenv("BROWSER_USE_MODEL", "gpt-4o-mini")
 HEADLESS = os.getenv("BROWSER_HEADLESS", "true").lower() not in ("false", "0", "no")
 SESSIONS_DIR = os.getenv("POLARIS_SESSIONS_DIR", "/tmp/polaris_sessions")
+
+_AUTH_PATTERNS = {"login", "auth", "keycloak", "signin", "sso", "realms"}
 
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger("polaris-mcp")
@@ -143,13 +146,43 @@ browser_session_list()
 ════════════════════════════════════════════════════════════════
 
 browser_screenshot(url, session_file, wait_seconds, full_page)
-  Returns a base64 PNG screenshot.
+  Returns a base64 PNG screenshot wrapped in JSON.
 
 browser_get_page_content(url, session_file, wait_seconds)
   Returns visible page text (no HTML), truncated at 20,000 characters.
 
 browser_get_help()
   Returns this documentation as a string.
+
+════════════════════════════════════════════════════════════════
+ _polaris TELEMETRY (present in every tool response)
+════════════════════════════════════════════════════════════════
+
+Every tool response includes a `_polaris` block with observability data:
+
+  _polaris.tool              — tool name that was called
+  _polaris.duration_ms       — total wall-clock time in milliseconds
+  _polaris.browser           — browser state at end of execution:
+    .final_url               — where the browser ended up
+    .title                   — page title at end
+    .headless                — whether browser ran headless
+    .session_used            — whether a session file was loaded
+    .redirect_detected       — True if final_url looks like a login/auth redirect
+    .console_errors          — count of JS errors during execution
+    .performance             — page_load_ms and dom_ready_ms from the Performance API
+  _polaris.effective_params  — key parameters actually resolved and used
+  _polaris.warnings          — list of non-fatal issues detected during execution
+
+Use _polaris to reason about:
+  • Performance: page_load_ms high → site under load or misconfigured
+  • Session health: redirect_detected=True → re-authenticate before retrying
+  • Selector reliability: warnings about match counts → re-map the page
+  • Step bottlenecks: per-step duration_ms in execute_sequence results
+
+Per-step telemetry in browser_execute_sequence results:
+  { step, action, success, duration_ms, selector_match_count, result, error }
+  selector_match_count = 0 → broken selector
+  selector_match_count > 1 → ambiguous selector, first element was used
 
 ════════════════════════════════════════════════════════════════
  RECOMMENDED WORKFLOW FOR A NEW SITE
@@ -174,6 +207,85 @@ mcp = FastMCP(
     port=MCP_PORT,
     instructions=_INSTRUCTIONS,
 )
+
+
+# ── telemetry helpers ─────────────────────────────────────────────────────────
+
+def _start() -> float:
+    return _time.monotonic()
+
+
+def _elapsed_ms(t0: float) -> int:
+    return round((_time.monotonic() - t0) * 1000)
+
+
+async def _page_perf(page: Page) -> dict:
+    try:
+        return await page.evaluate("""() => {
+            const nav = performance.getEntriesByType('navigation')[0];
+            if (!nav) return {};
+            const load = Math.round(nav.loadEventEnd - nav.startTime);
+            const dom  = Math.round(nav.domContentLoadedEventEnd - nav.startTime);
+            return load > 0 ? { page_load_ms: load, dom_ready_ms: dom } : {};
+        }""")
+    except Exception:
+        return {}
+
+
+async def _fetch_title(page: Page) -> str:
+    try:
+        return await page.title()
+    except Exception:
+        return ""
+
+
+def _browser_state(
+    page: Page,
+    session_file: Optional[str],
+    console_errors: int,
+    perf: dict,
+) -> dict:
+    final_url = page.url
+    state: dict = {
+        "final_url": final_url,
+        "title": "",
+        "headless": HEADLESS,
+        "session_used": bool(session_file and os.path.exists(session_file or "")),
+        "redirect_detected": any(p in final_url for p in _AUTH_PATTERNS),
+        "console_errors": console_errors,
+    }
+    if perf:
+        state["performance"] = perf
+    return state
+
+
+def _polaris(
+    tool: str,
+    t0: float,
+    browser: Optional[dict] = None,
+    params: Optional[dict] = None,
+    warnings: Optional[list] = None,
+) -> dict:
+    block: dict = {"tool": tool, "duration_ms": _elapsed_ms(t0)}
+    if browser:
+        block["browser"] = browser
+    if params:
+        block["effective_params"] = params
+    if warnings:
+        block["warnings"] = warnings
+    return block
+
+
+def _wrap(data: dict, polaris_block: dict) -> str:
+    data["_polaris"] = polaris_block
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+def _attach_console_listener(page: Page) -> list:
+    errors: list = []
+    page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
+    page.on("pageerror", lambda e: errors.append(str(e)))
+    return errors
 
 
 # ── internal helpers ──────────────────────────────────────────────────────────
@@ -208,7 +320,6 @@ async def _make_context(p, session_file: Optional[str]) -> tuple[Browser, Browse
 
 
 async def _exec_actions_code(page: Page, ctx: BrowserContext, code: str) -> None:
-    """Wraps and executes an actions_code string inside an async function."""
     cleaned = textwrap.dedent(code.rstrip())
     indented = "\n".join(f"    {line}" for line in cleaned.splitlines())
     fn_src = f"async def _actions(page, context, asyncio):\n{indented}\n"
@@ -217,7 +328,6 @@ async def _exec_actions_code(page: Page, ctx: BrowserContext, code: str) -> None
     await ns["_actions"](page, ctx, asyncio)
 
 
-# JavaScript that extracts a complete page inventory
 _INVENTORY_JS = """
 () => {
     const qaMap = {};
@@ -344,25 +454,38 @@ async def browser_login(
         wait_after_login: Seconds to wait after submit before saving the session.
 
     Returns:
-        Final URL, page title, and session file path.
+        JSON with final_url, title, session_file, and _polaris metadata.
     """
+    t0 = _start()
+    warnings: list[str] = []
+    used_username_sel = username_selector.split(",")[0]
+    used_password_sel = password_selector.split(",")[0]
+    used_submit_sel = submit_selector.split(",")[0]
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=HEADLESS)
         ctx = await browser.new_context(viewport={"width": 1440, "height": 900})
         page = await ctx.new_page()
+        errors = _attach_console_listener(page)
 
         await page.goto(login_url, wait_until="networkidle", timeout=30_000)
 
+        matched_user = False
         for sel in username_selector.split(","):
             try:
                 await page.fill(sel.strip(), username_value, timeout=3_000)
+                used_username_sel = sel.strip()
+                matched_user = True
                 break
             except Exception:
                 continue
+        if not matched_user:
+            warnings.append("No username selector matched — login may have failed")
 
         for sel in password_selector.split(","):
             try:
                 await page.fill(sel.strip(), password_value, timeout=3_000)
+                used_password_sel = sel.strip()
                 break
             except Exception:
                 continue
@@ -370,6 +493,7 @@ async def browser_login(
         for sel in submit_selector.split(","):
             try:
                 await page.click(sel.strip(), timeout=3_000)
+                used_submit_sel = sel.strip()
                 break
             except Exception:
                 continue
@@ -377,12 +501,27 @@ async def browser_login(
         await page.wait_for_load_state("networkidle", timeout=30_000)
         await asyncio.sleep(wait_after_login)
 
-        final_url = page.url
-        title = await page.title()
+        perf = await _page_perf(page)
+        title = await _fetch_title(page)
+        bstate = _browser_state(page, session_file, len(errors), perf)
+        bstate["title"] = title
+
+        if bstate["redirect_detected"]:
+            warnings.append("Final URL contains auth pattern — login may not have completed")
+
         await ctx.storage_state(path=session_file)
         await browser.close()
 
-    return f"Login complete. url={final_url} | title={title} | session={session_file}"
+    return _wrap(
+        {"session_file": session_file, "final_url": bstate["final_url"], "title": title},
+        _polaris("browser_login", t0, browser=bstate,
+                 params={"username_selector": used_username_sel,
+                         "password_selector": used_password_sel,
+                         "submit_selector": used_submit_sel,
+                         "session_file": session_file,
+                         "wait_after_login": wait_after_login},
+                 warnings=warnings or None),
+    )
 
 
 # ── browser_map_site ──────────────────────────────────────────────────────────
@@ -417,18 +556,21 @@ async def browser_map_site(
         follow_links: If False, maps only the entry URL without following links.
 
     Returns:
-        JSON: { base_url, pages_mapped, pages: [...], selector_index: {...} }
+        JSON: { base_url, pages_mapped, pages, selector_index, _polaris }
     """
+    t0 = _start()
     parsed = urlparse(url)
     base_origin = f"{parsed.scheme}://{parsed.hostname}"
 
     visited: set[str] = set()
     queue: list[str] = [url]
     pages: list[dict] = []
+    warnings: list[str] = []
 
     async with async_playwright() as p:
         browser, ctx = await _make_context(p, session_file)
         page = await ctx.new_page()
+        errors = _attach_console_listener(page)
 
         while queue and len(pages) < max_pages:
             current = queue.pop(0)
@@ -441,7 +583,7 @@ async def browser_map_site(
                 await asyncio.sleep(wait_seconds)
 
                 if urlparse(page.url).hostname != parsed.hostname:
-                    logger.warning("Redirected off-domain to %s — stopping crawl.", page.url)
+                    warnings.append(f"Redirected off-domain to {page.url} — crawl stopped")
                     break
 
                 snap = await _snapshot(page)
@@ -454,17 +596,27 @@ async def browser_map_site(
                             queue.append(full)
 
             except Exception as e:
-                logger.warning("Error mapping %s: %s", current, e)
+                warnings.append(f"Error mapping {current}: {e}")
 
+        perf = await _page_perf(page)
+        bstate = _browser_state(page, session_file, len(errors), perf)
+        bstate["title"] = await _fetch_title(page)
         await browser.close()
 
-    return json.dumps({
-        "base_url": url,
-        "session_used": bool(session_file and os.path.exists(session_file or "")),
-        "pages_mapped": len(pages),
-        "pages": pages,
-        "selector_index": _selector_index(pages),
-    }, ensure_ascii=False, indent=2)
+    idx = _selector_index(pages)
+    return _wrap(
+        {
+            "base_url": url,
+            "pages_mapped": len(pages),
+            "pages": pages,
+            "selector_index": idx,
+        },
+        _polaris("browser_map_site", t0, browser=bstate,
+                 params={"max_pages": max_pages, "follow_links": follow_links,
+                         "wait_seconds": wait_seconds,
+                         "session_used": bool(session_file and os.path.exists(session_file or ""))},
+                 warnings=warnings or None),
+    )
 
 
 # ── browser_explore_page ──────────────────────────────────────────────────────
@@ -494,11 +646,15 @@ async def browser_explore_page(
         wait_seconds: Seconds to wait after loading (default: 5.0).
 
     Returns:
-        JSON: { static_elements, revealed_after_interactions: [{trigger_qa, new_elements}] }
+        JSON: { static_elements, revealed_after_interactions, total_revealed_qa, _polaris }
     """
+    t0 = _start()
+    warnings: list[str] = []
+
     async with async_playwright() as p:
         browser, ctx = await _make_context(p, session_file)
         page = await ctx.new_page()
+        errors = _attach_console_listener(page)
 
         await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
         await asyncio.sleep(wait_seconds)
@@ -506,11 +662,13 @@ async def browser_explore_page(
         static = await _snapshot(page)
         static_qa = {el["qa"] for el in static["data_qa_elements"]}
         revealed: list[dict] = []
+        triggers_tested = 0
 
         if trigger_interactions:
             origin_url = page.url
             for trigger in static.get("interactive_triggers", [])[:max_triggers]:
                 qa = trigger["qa"]
+                ts = _start()
                 try:
                     el = page.locator(f'[data-qa="{qa}"]').first
                     if not await el.is_visible(timeout=2_000):
@@ -518,6 +676,7 @@ async def browser_explore_page(
 
                     await el.click(force=True)
                     await asyncio.sleep(1.5)
+                    triggers_tested += 1
 
                     if page.url != origin_url:
                         await page.goto(origin_url, wait_until="domcontentloaded", timeout=20_000)
@@ -532,27 +691,38 @@ async def browser_explore_page(
                             "new_elements": [
                                 e for e in after["data_qa_elements"] if e["qa"] in new_qa
                             ],
+                            "trigger_duration_ms": _elapsed_ms(ts),
                         })
 
                     await page.keyboard.press("Escape")
                     await asyncio.sleep(0.8)
                 except Exception as e:
-                    logger.debug("Trigger '%s' failed: %s", qa, e)
+                    warnings.append(f"Trigger '{qa}' could not be activated: {e}")
                     try:
                         await page.keyboard.press("Escape")
                     except Exception:
                         pass
 
+        perf = await _page_perf(page)
+        bstate = _browser_state(page, session_file, len(errors), perf)
+        bstate["title"] = await _fetch_title(page)
         await browser.close()
 
-    return json.dumps({
-        "url": url,
-        "path": static["path"],
-        "title": static["title"],
-        "static_elements": static,
-        "revealed_after_interactions": revealed,
-        "total_revealed_qa": sum(len(r["new_elements"]) for r in revealed),
-    }, ensure_ascii=False, indent=2)
+    return _wrap(
+        {
+            "url": url,
+            "path": static["path"],
+            "title": static["title"],
+            "static_elements": static,
+            "revealed_after_interactions": revealed,
+            "total_revealed_qa": sum(len(r["new_elements"]) for r in revealed),
+        },
+        _polaris("browser_explore_page", t0, browser=bstate,
+                 params={"trigger_interactions": trigger_interactions,
+                         "triggers_tested": triggers_tested,
+                         "max_triggers": max_triggers},
+                 warnings=warnings or None),
+    )
 
 
 # ── browser_intercept_network ─────────────────────────────────────────────────
@@ -577,19 +747,20 @@ async def browser_intercept_network(
         url: Starting URL.
         session_file: Session file for authenticated sites.
         actions_code: Optional async Python code (receives `page`) to execute after
-                      the page loads. Use this to trigger user actions and capture
-                      the resulting API calls.
+                      the page loads. Captures API calls triggered by actions.
         wait_seconds: Seconds to wait after page load (default: 5.0).
         resource_types: Comma-separated resource types to capture (default: "fetch,xhr").
         filter_url_contains: Only capture requests whose URL contains this string.
         max_body_chars: Truncate request/response bodies at this length (default: 2000).
 
     Returns:
-        JSON: { requests_captured, entries: [{method, url, status, request_body, response_body}] }
+        JSON: { requests_captured, entries, _polaris }
     """
+    t0 = _start()
     target_types = {t.strip() for t in resource_types.split(",")}
     entries: list[dict] = []
     lock = asyncio.Lock()
+    warnings: list[str] = []
 
     async def on_finished(request):
         if request.resource_type not in target_types:
@@ -636,6 +807,7 @@ async def browser_intercept_network(
     async with async_playwright() as p:
         browser, ctx = await _make_context(p, session_file)
         page = await ctx.new_page()
+        errors = _attach_console_listener(page)
         page.on("requestfinished", on_finished)
 
         await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
@@ -645,13 +817,24 @@ async def browser_intercept_network(
             await _exec_actions_code(page, ctx, actions_code)
 
         await asyncio.sleep(1.5)
+        perf = await _page_perf(page)
+        bstate = _browser_state(page, session_file, len(errors), perf)
+        bstate["title"] = await _fetch_title(page)
         await browser.close()
 
-    return json.dumps({
-        "url": url,
-        "requests_captured": len(entries),
-        "entries": entries,
-    }, ensure_ascii=False, indent=2)
+    if not entries:
+        warnings.append(
+            f"No {resource_types} requests captured — "
+            "check resource_types or filter_url_contains"
+        )
+
+    return _wrap(
+        {"url": url, "requests_captured": len(entries), "entries": entries},
+        _polaris("browser_intercept_network", t0, browser=bstate,
+                 params={"resource_types": resource_types,
+                         "filter_url_contains": filter_url_contains},
+                 warnings=warnings or None),
+    )
 
 
 # ── browser_capture_console ───────────────────────────────────────────────────
@@ -678,8 +861,9 @@ async def browser_capture_console(
         levels: Comma-separated console levels to capture (default: "log,warn,error,info").
 
     Returns:
-        JSON: { errors, warnings, info, all_messages, messages_captured }
+        JSON: { errors, warnings_console, info, all_messages, messages_captured, _polaris }
     """
+    t0 = _start()
     target_levels = {lv.strip() for lv in levels.split(",")}
     messages: list[dict] = []
 
@@ -710,16 +894,24 @@ async def browser_capture_console(
             await _exec_actions_code(page, ctx, actions_code)
             await asyncio.sleep(1.0)
 
+        perf = await _page_perf(page)
+        error_count = sum(1 for m in messages if m["type"] in ("error", "pageerror"))
+        bstate = _browser_state(page, session_file, error_count, perf)
+        bstate["title"] = await _fetch_title(page)
         await browser.close()
 
-    return json.dumps({
-        "url": url,
-        "messages_captured": len(messages),
-        "errors": [m for m in messages if m["type"] in ("error", "pageerror")],
-        "warnings": [m for m in messages if m["type"] == "warn"],
-        "info": [m for m in messages if m["type"] in ("log", "info")],
-        "all_messages": messages,
-    }, ensure_ascii=False, indent=2)
+    return _wrap(
+        {
+            "url": url,
+            "messages_captured": len(messages),
+            "errors": [m for m in messages if m["type"] in ("error", "pageerror")],
+            "warnings_console": [m for m in messages if m["type"] == "warn"],
+            "info": [m for m in messages if m["type"] in ("log", "info")],
+            "all_messages": messages,
+        },
+        _polaris("browser_capture_console", t0, browser=bstate,
+                 params={"levels": levels}),
+    )
 
 
 # ── session manager ───────────────────────────────────────────────────────────
@@ -753,13 +945,14 @@ async def browser_session_save(
         wait_after_login: Seconds to wait after submit.
 
     Returns:
-        Confirmation with session file path.
+        JSON with name, session_file, login result, and _polaris metadata.
     """
+    t0 = _start()
     os.makedirs(SESSIONS_DIR, exist_ok=True)
     session_file = os.path.join(SESSIONS_DIR, f"{name}.json")
     meta_file = os.path.join(SESSIONS_DIR, f"{name}.meta.json")
 
-    login_result = await browser_login(
+    login_result_raw = await browser_login(
         login_url=login_url,
         username_value=username_value,
         password_value=password_value,
@@ -769,6 +962,7 @@ async def browser_session_save(
         session_file=session_file,
         wait_after_login=wait_after_login,
     )
+    login_data = json.loads(login_result_raw)
 
     meta = {
         "name": name,
@@ -782,7 +976,13 @@ async def browser_session_save(
     with open(meta_file, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
-    return f"Session '{name}' saved. {login_result}"
+    return _wrap(
+        {"name": name, "session_file": session_file,
+         "login_final_url": login_data.get("final_url"),
+         "login_title": login_data.get("title")},
+        _polaris("browser_session_save", t0,
+                 params={"name": name, "login_url": login_url, "session_file": session_file}),
+    )
 
 
 @mcp.tool()
@@ -803,25 +1003,31 @@ async def browser_session_check(
                                  redirect to the login page.
 
     Returns:
-        JSON: { name, valid, final_url, reason, session_file }
+        JSON: { name, valid, final_url, reason, session_file, _polaris }
     """
+    t0 = _start()
     session_file = os.path.join(SESSIONS_DIR, f"{name}.json")
     meta_file = os.path.join(SESSIONS_DIR, f"{name}.meta.json")
 
     if not os.path.exists(session_file):
-        return json.dumps({
-            "name": name,
-            "valid": False,
-            "reason": f"Session '{name}' not found in {SESSIONS_DIR}",
-        })
+        return _wrap(
+            {"name": name, "valid": False,
+             "reason": f"Session '{name}' not found in {SESSIONS_DIR}"},
+            _polaris("browser_session_check", t0,
+                     warnings=[f"Session file not found: {session_file}"]),
+        )
 
     patterns = [pt.strip() for pt in login_redirect_patterns.split(",")]
 
     async with async_playwright() as p:
         browser, ctx = await _make_context(p, session_file)
         page = await ctx.new_page()
+        errors = _attach_console_listener(page)
         await page.goto(check_url, wait_until="domcontentloaded", timeout=30_000)
         await asyncio.sleep(3)
+        perf = await _page_perf(page)
+        bstate = _browser_state(page, session_file, len(errors), perf)
+        bstate["title"] = await _fetch_title(page)
         final_url = page.url
         await browser.close()
 
@@ -836,13 +1042,17 @@ async def browser_session_check(
         with open(meta_file, "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2)
 
-    return json.dumps({
-        "name": name,
-        "valid": valid,
-        "final_url": final_url,
-        "session_file": session_file,
-        "reason": "Redirected to login — session expired" if redirected else "Session is active",
-    }, ensure_ascii=False, indent=2)
+    return _wrap(
+        {
+            "name": name,
+            "valid": valid,
+            "final_url": final_url,
+            "session_file": session_file,
+            "reason": "Redirected to login — session expired" if redirected else "Session is active",
+        },
+        _polaris("browser_session_check", t0, browser=bstate,
+                 params={"name": name, "check_url": check_url}),
+    )
 
 
 @mcp.tool()
@@ -850,24 +1060,28 @@ def browser_session_list() -> str:
     """List all saved named sessions with their metadata and last-known validity.
 
     Returns:
-        JSON: { sessions: [{name, username, login_url, created_at, last_valid, ...}], count }
+        JSON: { sessions, count, _polaris }
     """
-    if not os.path.exists(SESSIONS_DIR):
-        return json.dumps({"sessions": [], "count": 0})
-
+    t0 = _start()
     sessions = []
-    for fname in sorted(os.listdir(SESSIONS_DIR)):
-        if not fname.endswith(".meta.json"):
-            continue
-        try:
-            with open(os.path.join(SESSIONS_DIR, fname), encoding="utf-8") as f:
-                meta = json.load(f)
-            meta["session_file_exists"] = os.path.exists(meta.get("session_file", ""))
-            sessions.append(meta)
-        except Exception:
-            continue
 
-    return json.dumps({"sessions": sessions, "count": len(sessions)}, indent=2)
+    if os.path.exists(SESSIONS_DIR):
+        for fname in sorted(os.listdir(SESSIONS_DIR)):
+            if not fname.endswith(".meta.json"):
+                continue
+            try:
+                with open(os.path.join(SESSIONS_DIR, fname), encoding="utf-8") as f:
+                    meta = json.load(f)
+                meta["session_file_exists"] = os.path.exists(meta.get("session_file", ""))
+                sessions.append(meta)
+            except Exception:
+                continue
+
+    return _wrap(
+        {"sessions": sessions, "count": len(sessions)},
+        _polaris("browser_session_list", t0,
+                 params={"sessions_dir": SESSIONS_DIR}),
+    )
 
 
 # ── browser_diff_pages ────────────────────────────────────────────────────────
@@ -900,11 +1114,15 @@ async def browser_diff_pages(
         wait_seconds: Seconds to wait after loading each state.
 
     Returns:
-        JSON: { added_qa, removed_qa, changed_texts, changed_counts, summary }
+        JSON: { added_qa, removed_qa, changed_texts, changed_counts, summary, _polaris }
     """
+    t0 = _start()
+    warnings: list[str] = []
+
     async with async_playwright() as p:
         browser, ctx = await _make_context(p, session_file)
         page = await ctx.new_page()
+        errors = _attach_console_listener(page)
 
         await page.goto(url_a, wait_until="domcontentloaded", timeout=30_000)
         await asyncio.sleep(wait_seconds)
@@ -916,8 +1134,13 @@ async def browser_diff_pages(
         elif actions_code:
             await _exec_actions_code(page, ctx, actions_code)
             await asyncio.sleep(1.5)
+        else:
+            warnings.append("Neither url_b nor actions_code provided — diff will be empty")
 
         snap_b = await _snapshot(page)
+        perf = await _page_perf(page)
+        bstate = _browser_state(page, session_file, len(errors), perf)
+        bstate["title"] = await _fetch_title(page)
         await browser.close()
 
     qa_a = {el["qa"]: el for el in snap_a["data_qa_elements"]}
@@ -938,20 +1161,28 @@ async def browser_diff_pages(
         if c_a != c_b:
             changed_counts.append({"qa": qa, "before": c_a, "after": c_b})
 
-    return json.dumps({
-        "snapshot_a": {"url": snap_a["url"], "title": snap_a["title"]},
-        "snapshot_b": {"url": snap_b["url"], "title": snap_b["title"]},
-        "added_qa": added,
-        "removed_qa": removed,
-        "changed_texts": changed_texts,
-        "changed_counts": changed_counts,
-        "summary": {
-            "added": len(added),
-            "removed": len(removed),
-            "text_changes": len(changed_texts),
-            "count_changes": len(changed_counts),
+    if not added and not removed and not changed_texts and not changed_counts:
+        warnings.append("No differences detected between the two states")
+
+    return _wrap(
+        {
+            "snapshot_a": {"url": snap_a["url"], "title": snap_a["title"]},
+            "snapshot_b": {"url": snap_b["url"], "title": snap_b["title"]},
+            "added_qa": added,
+            "removed_qa": removed,
+            "changed_texts": changed_texts,
+            "changed_counts": changed_counts,
+            "summary": {
+                "added": len(added),
+                "removed": len(removed),
+                "text_changes": len(changed_texts),
+                "count_changes": len(changed_counts),
+            },
         },
-    }, ensure_ascii=False, indent=2)
+        _polaris("browser_diff_pages", t0, browser=bstate,
+                 params={"url_a": url_a, "url_b": url_b},
+                 warnings=warnings or None),
+    )
 
 
 # ── browser_accessibility_tree ────────────────────────────────────────────────
@@ -979,14 +1210,20 @@ async def browser_accessibility_tree(
         max_depth: Maximum tree depth in the flat representation (default: 6).
 
     Returns:
-        JSON: { node_count, flat: [{depth, role, name, value, ...}], tree }
+        JSON: { node_count, flat, tree, _polaris }
     """
+    t0 = _start()
+
     async with async_playwright() as p:
         browser, ctx = await _make_context(p, session_file)
         page = await ctx.new_page()
+        errors = _attach_console_listener(page)
         await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
         await asyncio.sleep(wait_seconds)
         tree = await page.accessibility.snapshot(interesting_only=interesting_only)
+        perf = await _page_perf(page)
+        bstate = _browser_state(page, session_file, len(errors), perf)
+        bstate["title"] = await _fetch_title(page)
         await browser.close()
 
     def flatten(node: Optional[dict], depth: int = 0, acc: Optional[list] = None) -> list:
@@ -1010,12 +1247,11 @@ async def browser_accessibility_tree(
         return acc
 
     flat = flatten(tree)
-    return json.dumps({
-        "url": url,
-        "node_count": len(flat),
-        "flat": flat,
-        "tree": tree,
-    }, ensure_ascii=False, indent=2)
+    return _wrap(
+        {"url": url, "node_count": len(flat), "flat": flat, "tree": tree},
+        _polaris("browser_accessibility_tree", t0, browser=bstate,
+                 params={"interesting_only": interesting_only, "max_depth": max_depth}),
+    )
 
 
 # ── browser_execute_sequence ──────────────────────────────────────────────────
@@ -1036,40 +1272,46 @@ async def browser_execute_sequence(
       { "action": "goto",       "url": "https://..." }
       { "action": "click",      "selector": "[data-qa=X]", "force": false,
                                 "index": 0, "wait_after": 1.0, "timeout": 10000 }
-      { "action": "fill",       "selector": "#email", "value": "text",
-                                "timeout": 10000 }
+      { "action": "fill",       "selector": "#email", "value": "text" }
       { "action": "select",     "selector": "select", "value": "option" }
       { "action": "press",      "key": "Enter" }
       { "action": "hover",      "selector": "[data-qa=X]" }
       { "action": "scroll",     "x": 0, "y": 500 }
-      { "action": "wait_for",   "selector": "[data-qa=X]", "state": "visible",
-                                "timeout": 10000 }
+      { "action": "wait_for",   "selector": "[data-qa=X]", "state": "visible" }
       { "action": "wait_for",   "text": "Success", "timeout": 5000 }
       { "action": "wait_for",   "seconds": 2 }
       { "action": "snapshot" }
       { "action": "screenshot", "full_page": false }
       { "action": "evaluate",   "expression": "document.title" }
 
+    Each step result includes duration_ms and selector_match_count (for click/fill/
+    hover/wait_for steps) so the AI can reason about performance and selector quality.
+
     Args:
-        steps_json: JSON array of step objects (see actions above).
+        steps_json: JSON array of step objects.
         session_file: Session file for authenticated sites.
         start_url: URL to navigate to before running the sequence.
         stop_on_error: Stop on the first failed step (default: True).
 
     Returns:
-        JSON: { steps_total, steps_succeeded, final_url,
-                results: [{step, action, success, result, error}] }
+        JSON: { steps_total, steps_succeeded, final_url, results, _polaris }
     """
+    t0 = _start()
     try:
         steps: list[dict] = json.loads(steps_json)
     except json.JSONDecodeError as e:
-        return json.dumps({"success": False, "error": f"Invalid JSON in steps_json: {e}"})
+        return _wrap(
+            {"success": False, "error": f"Invalid JSON in steps_json: {e}"},
+            _polaris("browser_execute_sequence", t0),
+        )
 
     results: list[dict] = []
+    seq_warnings: list[str] = []
 
     async with async_playwright() as p:
         browser, ctx = await _make_context(p, session_file)
         page = await ctx.new_page()
+        errors = _attach_console_listener(page)
 
         if start_url:
             await page.goto(start_url, wait_until="domcontentloaded", timeout=30_000)
@@ -1077,37 +1319,57 @@ async def browser_execute_sequence(
 
         for i, step in enumerate(steps):
             action = step.get("action", "")
-            sr: dict = {"step": i + 1, "action": action, "success": False,
-                        "result": None, "error": None}
+            st = _start()
+            sr: dict = {
+                "step": i + 1,
+                "action": action,
+                "success": False,
+                "duration_ms": 0,
+                "selector_match_count": None,
+                "result": None,
+                "error": None,
+            }
 
             try:
                 if action == "goto":
                     await page.goto(step["url"], wait_until="domcontentloaded", timeout=30_000)
                     sr["result"] = {"url": page.url}
 
-                elif action == "click":
-                    el = page.locator(step["selector"])
-                    if step.get("index"):
-                        el = el.nth(step["index"])
-                    await el.click(force=step.get("force", False),
-                                   timeout=step.get("timeout", 10_000))
-                    await asyncio.sleep(step.get("wait_after", 1.0))
-                    sr["result"] = {"url": page.url}
+                elif action in ("click", "fill", "hover"):
+                    sel = step["selector"]
+                    count = await page.locator(sel).count()
+                    sr["selector_match_count"] = count
+                    if count == 0:
+                        seq_warnings.append(
+                            f"Step {i+1} ({action}): selector '{sel}' matched 0 elements"
+                        )
+                        raise ValueError(f"Selector '{sel}' matched 0 elements")
+                    if count > 1:
+                        seq_warnings.append(
+                            f"Step {i+1} ({action}): selector '{sel}' matched {count} elements, used first"
+                        )
 
-                elif action == "fill":
-                    el = page.locator(step["selector"])
-                    await el.wait_for(state="visible", timeout=step.get("timeout", 10_000))
-                    await el.clear()
-                    await el.fill(step["value"])
+                    if action == "click":
+                        el = page.locator(sel)
+                        if step.get("index"):
+                            el = el.nth(step["index"])
+                        await el.click(force=step.get("force", False),
+                                       timeout=step.get("timeout", 10_000))
+                        await asyncio.sleep(step.get("wait_after", 1.0))
+                        sr["result"] = {"url": page.url}
+                    elif action == "fill":
+                        el = page.locator(sel)
+                        await el.wait_for(state="visible", timeout=step.get("timeout", 10_000))
+                        await el.clear()
+                        await el.fill(step["value"])
+                    elif action == "hover":
+                        await page.locator(sel).hover()
 
                 elif action == "select":
                     await page.locator(step["selector"]).select_option(step["value"])
 
                 elif action == "press":
                     await page.keyboard.press(step["key"])
-
-                elif action == "hover":
-                    await page.locator(step["selector"]).hover()
 
                 elif action == "scroll":
                     x, y = step.get("x", 0), step.get("y", 500)
@@ -1116,6 +1378,8 @@ async def browser_execute_sequence(
                 elif action == "wait_for":
                     timeout = step.get("timeout", 10_000)
                     if sel := step.get("selector"):
+                        count = await page.locator(sel).count()
+                        sr["selector_match_count"] = count
                         await page.locator(sel).wait_for(
                             state=step.get("state", "visible"), timeout=timeout
                         )
@@ -1147,23 +1411,34 @@ async def browser_execute_sequence(
 
             except Exception as e:
                 sr["error"] = str(e)
+                sr["duration_ms"] = _elapsed_ms(st)
                 results.append(sr)
                 if stop_on_error:
                     break
                 continue
 
+            sr["duration_ms"] = _elapsed_ms(st)
             results.append(sr)
 
+        perf = await _page_perf(page)
+        bstate = _browser_state(page, session_file, len(errors), perf)
+        bstate["title"] = await _fetch_title(page)
         final_url = page.url
         await browser.close()
 
-    return json.dumps({
-        "steps_total": len(steps),
-        "steps_executed": len(results),
-        "steps_succeeded": sum(1 for r in results if r["success"]),
-        "final_url": final_url,
-        "results": results,
-    }, ensure_ascii=False, indent=2)
+    return _wrap(
+        {
+            "steps_total": len(steps),
+            "steps_executed": len(results),
+            "steps_succeeded": sum(1 for r in results if r["success"]),
+            "final_url": final_url,
+            "results": results,
+        },
+        _polaris("browser_execute_sequence", t0, browser=bstate,
+                 params={"steps_total": len(steps), "stop_on_error": stop_on_error,
+                         "session_used": bool(session_file and os.path.exists(session_file or ""))},
+                 warnings=seq_warnings or None),
+    )
 
 
 # ── browser_get_storage ───────────────────────────────────────────────────────
@@ -1185,11 +1460,14 @@ async def browser_get_storage(
         wait_seconds: Seconds to wait after loading (default: 3.0).
 
     Returns:
-        JSON: { local_storage, session_storage, cookies, *_keys, cookies_count }
+        JSON: { local_storage, session_storage, cookies, *_keys, cookies_count, _polaris }
     """
+    t0 = _start()
+
     async with async_playwright() as p:
         browser, ctx = await _make_context(p, session_file)
         page = await ctx.new_page()
+        errors = _attach_console_listener(page)
         await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
         await asyncio.sleep(wait_seconds)
 
@@ -1204,19 +1482,25 @@ async def browser_get_storage(
             })
         """)
         cookies = await ctx.cookies()
+        perf = await _page_perf(page)
+        bstate = _browser_state(page, session_file, len(errors), perf)
+        bstate["title"] = await _fetch_title(page)
         await browser.close()
 
     ls = storage.get("localStorage", {})
     ss = storage.get("sessionStorage", {})
-    return json.dumps({
-        "url": url,
-        "local_storage": ls,
-        "session_storage": ss,
-        "cookies": cookies,
-        "local_storage_keys": list(ls.keys()),
-        "session_storage_keys": list(ss.keys()),
-        "cookies_count": len(cookies),
-    }, ensure_ascii=False, indent=2)
+    return _wrap(
+        {
+            "url": url,
+            "local_storage": ls,
+            "session_storage": ss,
+            "cookies": cookies,
+            "local_storage_keys": list(ls.keys()),
+            "session_storage_keys": list(ss.keys()),
+            "cookies_count": len(cookies),
+        },
+        _polaris("browser_get_storage", t0, browser=bstate),
+    )
 
 
 # ── browser_run_playwright ────────────────────────────────────────────────────
@@ -1249,8 +1533,9 @@ async def browser_run_playwright(
         timeout_seconds: Total execution timeout in seconds (default: 60).
 
     Returns:
-        JSON: { success, result, final_url, error }
+        JSON: { success, result, final_url, error, _polaris }
     """
+    t0 = _start()
     cleaned = textwrap.dedent(code.rstrip())
     indented = "\n".join(f"    {line}" for line in cleaned.splitlines())
     fn_src = f"async def _scenario(page, context, asyncio):\n{indented}\n"
@@ -1259,11 +1544,16 @@ async def browser_run_playwright(
     try:
         exec(fn_src, ns)  # noqa: S102
     except SyntaxError as e:
-        return json.dumps({"success": False, "result": None, "error": f"SyntaxError: {e}"})
+        return _wrap(
+            {"success": False, "result": None, "error": f"SyntaxError: {e}"},
+            _polaris("browser_run_playwright", t0),
+        )
 
+    bstate: dict = {}
     async with async_playwright() as p:
         browser, ctx = await _make_context(p, session_file)
         page = await ctx.new_page()
+        errors = _attach_console_listener(page)
 
         try:
             if start_url:
@@ -1274,19 +1564,33 @@ async def browser_run_playwright(
                 ns["_scenario"](page, ctx, asyncio),
                 timeout=timeout_seconds,
             )
+            perf = await _page_perf(page)
+            bstate = _browser_state(page, session_file, len(errors), perf)
+            bstate["title"] = await _fetch_title(page)
             output = {"success": True, "result": result, "final_url": page.url, "error": None}
 
         except asyncio.TimeoutError:
+            perf = await _page_perf(page)
+            bstate = _browser_state(page, session_file, len(errors), perf)
+            bstate["title"] = await _fetch_title(page)
             output = {
-                "success": False, "result": None,
+                "success": False, "result": None, "final_url": page.url,
                 "error": f"Execution timed out after {timeout_seconds}s",
             }
         except Exception as e:
+            perf = await _page_perf(page)
+            bstate = _browser_state(page, session_file, len(errors), perf)
+            bstate["title"] = await _fetch_title(page)
             output = {"success": False, "result": None, "final_url": page.url, "error": str(e)}
         finally:
             await browser.close()
 
-    return json.dumps(output, ensure_ascii=False, indent=2)
+    return _wrap(
+        output,
+        _polaris("browser_run_playwright", t0, browser=bstate,
+                 params={"timeout_seconds": timeout_seconds, "start_url": start_url,
+                         "session_used": bool(session_file and os.path.exists(session_file or ""))}),
+    )
 
 
 # ── browser_run_task ──────────────────────────────────────────────────────────
@@ -1313,12 +1617,12 @@ async def browser_run_task(
         model: LLM model ID (default: gpt-4o-mini). Prefix with "claude-" for Anthropic.
         max_steps: Maximum agent action steps (default: 30).
         sensitive_data: Dict of sensitive values not exposed to the LLM internally.
-                        Example: {"email": "user@x.com", "password": "secret"}.
         session_file: Session file for authenticated sites.
 
     Returns:
-        Final task result as plain text.
+        JSON: { result, model_used, _polaris }
     """
+    t0 = _start()
     use_model = model or DEFAULT_MODEL
     llm = _get_llm(use_model)
     full_task = f"Navigate to {start_url}. Then: {task}" if start_url else task
@@ -1331,15 +1635,18 @@ async def browser_run_task(
         max_actions_per_step=5,
         sensitive_data=sensitive_data or {},
     )
-    result = await agent.run(max_steps=max_steps)
-    final = result.final_result()
-    if final:
-        return str(final)
-    history = result.action_results()
-    if history:
-        last = history[-1]
-        return str(last.extracted_content or last.error or "Task completed with no output.")
-    return "Task completed with no output."
+    run_result = await agent.run(max_steps=max_steps)
+    final = run_result.final_result()
+    if not final:
+        history = run_result.action_results()
+        final = str(history[-1].extracted_content or history[-1].error or "") if history else ""
+
+    return _wrap(
+        {"result": str(final), "model_used": use_model},
+        _polaris("browser_run_task", t0,
+                 params={"model": use_model, "max_steps": max_steps,
+                         "session_used": bool(session_file and os.path.exists(session_file or ""))}),
+    )
 
 
 # ── browser_screenshot ────────────────────────────────────────────────────────
@@ -1360,13 +1667,19 @@ async def browser_screenshot(
         full_page: If True, captures the full scrollable page (default: False = viewport only).
 
     Returns:
-        Base64-encoded PNG as data:image/png;base64,...
+        JSON: { image: "data:image/png;base64,...", _polaris }
     """
+    t0 = _start()
+
     async with async_playwright() as p:
         browser, ctx = await _make_context(p, session_file)
         page = await ctx.new_page()
+        errors = _attach_console_listener(page)
         await page.goto(url, wait_until="networkidle", timeout=30_000)
         await asyncio.sleep(wait_seconds)
+        perf = await _page_perf(page)
+        bstate = _browser_state(page, session_file, len(errors), perf)
+        bstate["title"] = await _fetch_title(page)
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
             tmp = f.name
         await page.screenshot(path=tmp, full_page=full_page)
@@ -1375,7 +1688,12 @@ async def browser_screenshot(
     with open(tmp, "rb") as f:
         data = base64.b64encode(f.read()).decode()
     os.unlink(tmp)
-    return f"data:image/png;base64,{data}"
+
+    return _wrap(
+        {"image": f"data:image/png;base64,{data}"},
+        _polaris("browser_screenshot", t0, browser=bstate,
+                 params={"full_page": full_page, "wait_seconds": wait_seconds}),
+    )
 
 
 # ── browser_get_page_content ──────────────────────────────────────────────────
@@ -1394,23 +1712,35 @@ async def browser_get_page_content(
         wait_seconds: Seconds to wait after loading (default: 3.0).
 
     Returns:
-        Visible page text, truncated at 20,000 characters.
+        JSON: { text, chars, truncated, _polaris }
     """
+    t0 = _start()
+
     async with async_playwright() as p:
         browser, ctx = await _make_context(p, session_file)
         page = await ctx.new_page()
+        errors = _attach_console_listener(page)
         await page.goto(url, wait_until="networkidle", timeout=30_000)
         await asyncio.sleep(wait_seconds)
-        text = await page.evaluate("""
+        raw = await page.evaluate("""
             () => {
                 document.querySelectorAll('script,style,noscript').forEach(el => el.remove());
                 return (document.body || document.documentElement).innerText;
             }
         """)
+        perf = await _page_perf(page)
+        bstate = _browser_state(page, session_file, len(errors), perf)
+        bstate["title"] = await _fetch_title(page)
         await browser.close()
 
-    cleaned = "\n".join(line for line in text.splitlines() if line.strip())
-    return cleaned[:20_000]
+    cleaned = "\n".join(line for line in raw.splitlines() if line.strip())
+    truncated = len(cleaned) > 20_000
+    text = cleaned[:20_000]
+
+    return _wrap(
+        {"text": text, "chars": len(text), "truncated": truncated},
+        _polaris("browser_get_page_content", t0, browser=bstate),
+    )
 
 
 # ── browser_get_help ──────────────────────────────────────────────────────────
