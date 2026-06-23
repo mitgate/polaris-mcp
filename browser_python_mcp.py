@@ -6,8 +6,9 @@ discovering selectors, API calls, hidden elements, and storage state, so the AI
 acts with full knowledge instead of trial-and-error.
 
 Architecture layers:
-  KNOWLEDGE   → map_site, explore_page, intercept_network, accessibility_tree
-  EXECUTION   → run_playwright, execute_sequence, run_task
+  KNOWLEDGE   → map_site, explore_page, intercept_network, accessibility_tree,
+                get_external_resources
+  EXECUTION   → run_playwright, execute_sequence, run_task, inject_js
   VERIFICATION → diff_pages, capture_console, get_storage
   AUTH         → login, session_save, session_check, session_list
   UTILITIES    → screenshot, get_page_content, get_help
@@ -86,9 +87,25 @@ browser_accessibility_tree(url, session_file, interesting_only, max_depth)
   data-qa conventions. Returns flat + nested tree with roles and names.
   USE: On sites without data-qa, or to navigate by semantic meaning.
 
+browser_get_external_resources(url, session_file, wait_seconds, include_requests)
+  Collects every external origin a page contacts — via DOM scan (<script>,
+  <link>, <img>, <iframe>, <a href>) and live network interception.
+  Returns external_origins grouped by hostname with a category label
+  (analytics, cdn, api, font, social, ads, other) and full URL list.
+  USE: Discover the real API base URL, audit third-party tracking, or map
+  the backend before using browser_intercept_network.
+
 ════════════════════════════════════════════════════════════════
  LAYER 2 — EXECUTION  (after you know the selectors)
 ════════════════════════════════════════════════════════════════
+
+browser_inject_js(code, url, session_file, persistent, wait_seconds)
+  Inject and execute arbitrary JavaScript in the page context. Returns the
+  result (must be JSON-serializable). With persistent=True the script is
+  re-executed on every navigation within the session (addInitScript) —
+  useful for interceptors, helpers, or globals that survive SPA route changes.
+  USE: Extract data buried in JS state, reconstruct split auth tokens from
+  cookies, override window functions, set up event listeners.
 
 browser_run_playwright(code, session_file, start_url, timeout_seconds)
   Executes Python Playwright code directly — no LLM in the loop.
@@ -193,11 +210,15 @@ Per-step telemetry in browser_execute_sequence results:
    → read selector_index to know every [data-qa] and where it lives
 3. browser_explore_page("https://app.com/dashboard", trigger_interactions=True)
    → discover what dropdowns and modals are hidden behind triggers
-4. browser_intercept_network("https://app.com/dashboard", ...)
-   → map every API endpoint the page calls
-5. browser_execute_sequence('[{"action":"click","selector":"[data-qa=X]"}]', ...)
+4. browser_get_external_resources("https://app.com/dashboard", ...)
+   → find the real API base URL and all external origins
+5. browser_intercept_network("https://app.com/dashboard", filter_url_contains="api.")
+   → capture exact endpoint calls and payloads
+6. browser_inject_js("document.cookie", url="https://app.com/dashboard", ...)
+   → extract JS-accessible data (tokens, state) directly from the page
+7. browser_execute_sequence('[{"action":"click","selector":"[data-qa=X]"}]', ...)
    → act with precision using real selectors
-6. browser_diff_pages("https://app.com/dashboard", actions_code="...")
+8. browser_diff_pages("https://app.com/dashboard", actions_code="...")
    → confirm the UI changed as expected
 """
 
@@ -1740,6 +1761,238 @@ async def browser_get_page_content(
     return _wrap(
         {"text": text, "chars": len(text), "truncated": truncated},
         _polaris("browser_get_page_content", t0, browser=bstate),
+    )
+
+
+# ── browser_inject_js ─────────────────────────────────────────────────────────
+
+@mcp.tool()
+async def browser_inject_js(
+    code: str,
+    url: str,
+    session_file: Optional[str] = None,
+    persistent: bool = False,
+    wait_seconds: float = 3.0,
+) -> str:
+    """Inject and execute JavaScript in the live page context.
+
+    Evaluates arbitrary JS and returns the result. With persistent=True, the
+    script is installed via addInitScript so it re-runs on every navigation
+    within this session — useful for interceptors, helpers, or globals that
+    must survive SPA route changes.
+
+    The code must return a JSON-serializable value (object, array, string,
+    number, boolean, or null). Returning a DOM element or a Promise that
+    resolves to one will cause a serialization error.
+
+    Use cases:
+    • Extract data structures buried in JS state (window.__store__, etc.)
+    • Reconstruct auth tokens split across multiple cookies
+    • Override window.fetch or XMLHttpRequest to intercept calls
+    • Inject event listeners or UI helpers before an action
+    • Read IndexedDB or other browser APIs not exposed in the DOM
+
+    Args:
+        code: JavaScript expression or IIFE to evaluate.
+        url: Page URL to load before executing the code.
+        session_file: Session file for authenticated sites.
+        persistent: Re-execute on every page navigation via addInitScript.
+        wait_seconds: Seconds to wait after load before executing (default: 3.0).
+
+    Returns:
+        JSON: { result, persistent, _polaris }
+    """
+    t0 = _start()
+    warnings: list[str] = []
+
+    async with async_playwright() as p:
+        browser, ctx = await _make_context(p, session_file)
+        if persistent:
+            await ctx.add_init_script(code)
+        page = await ctx.new_page()
+        errors = _attach_console_listener(page)
+        await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        await asyncio.sleep(wait_seconds)
+
+        try:
+            result = await page.evaluate(code)
+        except Exception as e:
+            result = None
+            warnings.append(f"JS evaluation error: {e}")
+
+        perf = await _page_perf(page)
+        bstate = _browser_state(page, session_file, len(errors), perf)
+        bstate["title"] = await _fetch_title(page)
+        await browser.close()
+
+    return _wrap(
+        {"result": result, "persistent": persistent},
+        _polaris("browser_inject_js", t0, browser=bstate,
+                 params={"persistent": persistent, "wait_seconds": wait_seconds,
+                         "session_used": bool(session_file and os.path.exists(session_file or ""))},
+                 warnings=warnings or None),
+    )
+
+
+# ── browser_get_external_resources ────────────────────────────────────────────
+
+_CATEGORY_HINTS: dict[str, list[str]] = {
+    "analytics": ["analytics", "gtag", "google-analytics", "segment", "mixpanel",
+                  "hotjar", "heap", "amplitude", "clarity", "datadog", "newrelic"],
+    "cdn":       ["cdn", "cloudfront", "fastly", "akamai", "cloudflare",
+                  "unpkg", "jsdelivr", "cdnjs", "static", "assets"],
+    "font":      ["font", "typekit", "typography", "fonts.googleapis"],
+    "social":    ["facebook", "twitter", "linkedin", "instagram", "tiktok",
+                  "youtube", "whatsapp", "pinterest"],
+    "ads":       ["doubleclick", "adnxs", "adroll", "adsystem", "advertising",
+                  "criteo", "taboola", "outbrain"],
+    "api":       ["api.", "/api", "graphql", "rest", "backend", "service"],
+}
+
+
+def _categorize_host(hostname: str) -> str:
+    h = hostname.lower()
+    for cat, hints in _CATEGORY_HINTS.items():
+        if any(x in h for x in hints):
+            return cat
+    return "other"
+
+
+@mcp.tool()
+async def browser_get_external_resources(
+    url: str,
+    session_file: Optional[str] = None,
+    wait_seconds: float = 5.0,
+    include_requests: bool = True,
+) -> str:
+    """Collect every external URL, domain, and resource a page loads or links to.
+
+    Combines two sources for maximum coverage:
+    1. Static DOM scan — <script src>, <link href>, <img src>, <iframe src>,
+       <video src>, <source src>, and <a href> pointing to external origins.
+    2. Live network interception — actual HTTP requests made during page load,
+       capturing dynamic imports, fetch() calls, XHR, and CDN requests.
+
+    Returns each unique external origin categorized:
+      analytics | cdn | api | font | social | ads | other
+
+    Use this to:
+    • Find the real API base URL before narrowing browser_intercept_network
+    • Audit third-party tracking and privacy exposure
+    • Discover CDN origins and static asset hosts
+    • Map the full backend surface area of a SPA
+
+    Args:
+        url: Page URL to analyze.
+        session_file: Session file for authenticated sites.
+        wait_seconds: Seconds to wait after loading (default: 5.0).
+        include_requests: Capture live network requests in addition to DOM scan.
+
+    Returns:
+        JSON: { external_origin_count, external_origins, all_external_url_count, _polaris }
+        external_origins is sorted by request count descending, each entry:
+          { hostname, category, count, urls: [{url, kind}] }
+    """
+    t0 = _start()
+    page_hostname = urlparse(url).hostname or ""
+    live_requests: list[dict] = []
+    lock = asyncio.Lock()
+
+    async def _on_request(req):
+        try:
+            h = urlparse(req.url).hostname or ""
+            if h and h != page_hostname:
+                async with lock:
+                    live_requests.append({
+                        "url": req.url,
+                        "hostname": h,
+                        "kind": req.resource_type,
+                    })
+        except Exception:
+            pass
+
+    async with async_playwright() as p:
+        browser, ctx = await _make_context(p, session_file)
+        page = await ctx.new_page()
+        errors = _attach_console_listener(page)
+        if include_requests:
+            page.on("requestfinished", _on_request)
+
+        await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        await asyncio.sleep(wait_seconds)
+
+        dom_items: list[dict] = await page.evaluate("""
+            (pageHostname) => {
+                const results = [];
+                const add = (src, kind) => {
+                    if (!src) return;
+                    try {
+                        const u = new URL(src, window.location.href);
+                        if (u.hostname && u.hostname !== pageHostname) {
+                            results.push({ url: u.href, hostname: u.hostname, kind });
+                        }
+                    } catch(e) {}
+                };
+                document.querySelectorAll('script[src]').forEach(el => add(el.src, 'script'));
+                document.querySelectorAll('link[href]').forEach(el =>
+                    add(el.href, el.rel || 'link'));
+                document.querySelectorAll('img[src],img[data-src]').forEach(el =>
+                    add(el.src || el.dataset.src, 'image'));
+                document.querySelectorAll('iframe[src]').forEach(el =>
+                    add(el.src, 'iframe'));
+                document.querySelectorAll('video[src],source[src]').forEach(el =>
+                    add(el.src, 'media'));
+                document.querySelectorAll('a[href]').forEach(el => {
+                    try {
+                        const u = new URL(el.href, window.location.href);
+                        if (u.hostname !== pageHostname) add(el.href, 'link');
+                    } catch(e) {}
+                });
+                return results;
+            }
+        """, page_hostname)
+
+        perf = await _page_perf(page)
+        bstate = _browser_state(page, session_file, len(errors), perf)
+        bstate["title"] = await _fetch_title(page)
+        await browser.close()
+
+    # Merge DOM items + live requests, deduplicate by URL
+    all_items = list(dom_items) + live_requests
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for item in all_items:
+        if item["url"] not in seen:
+            seen.add(item["url"])
+            unique.append(item)
+
+    # Group by hostname
+    by_host: dict[str, dict] = {}
+    for item in unique:
+        h = item["hostname"]
+        if h not in by_host:
+            by_host[h] = {
+                "hostname": h,
+                "category": _categorize_host(h),
+                "count": 0,
+                "urls": [],
+            }
+        by_host[h]["urls"].append({"url": item["url"], "kind": item.get("kind", "")})
+        by_host[h]["count"] += 1
+
+    origins = sorted(by_host.values(), key=lambda x: -x["count"])
+
+    return _wrap(
+        {
+            "url": url,
+            "external_origin_count": len(origins),
+            "external_origins": origins,
+            "all_external_url_count": len(unique),
+        },
+        _polaris("browser_get_external_resources", t0, browser=bstate,
+                 params={"include_requests": include_requests,
+                         "wait_seconds": wait_seconds,
+                         "session_used": bool(session_file and os.path.exists(session_file or ""))}),
     )
 
 
