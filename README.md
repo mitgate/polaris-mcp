@@ -13,12 +13,14 @@ and hidden elements — so it acts with knowledge instead of trial and error.
 
 ```
 KNOWLEDGE   → understand the site first
-  browser_map_site            BFS crawl → selector inventory across all pages
-  browser_explore_page        Click triggers to reveal hidden dropdowns / modals / tabs
-  browser_intercept_network   Capture live XHR/fetch: endpoints, payloads, responses
-  browser_accessibility_tree  ARIA tree — works on any site without data-qa attributes
+  browser_map_site               BFS crawl → selector inventory across all pages
+  browser_explore_page           Click triggers to reveal hidden dropdowns / modals / tabs
+  browser_intercept_network      Capture live XHR/fetch: endpoints, payloads, responses
+  browser_accessibility_tree     ARIA tree — works on any site without data-qa attributes
+  browser_get_external_resources All external origins a page contacts (DOM + network)
 
 EXECUTION   → act with real selectors
+  browser_inject_js           Inject and run JavaScript; returns the result
   browser_run_playwright      Run Python Playwright code directly (no LLM in the loop)
   browser_execute_sequence    Typed JSON action sequence: goto / click / fill / wait_for / ...
   browser_run_task            LLM-driven natural language automation (fallback / exploration)
@@ -45,11 +47,13 @@ UTILITIES
 ## How it works
 
 ```
-1. Map the site     →  know every selector before writing a single line
-2. Explore pages    →  discover dropdowns / modals hidden behind interactions
-3. Intercept APIs   →  see every endpoint the frontend calls
-4. Execute          →  use real selectors from the map (precise, deterministic)
-5. Verify           →  diff the UI state before and after each action
+1. Map the site       →  know every selector before writing a single line
+2. Explore pages      →  discover dropdowns / modals hidden behind interactions
+3. External resources →  find all external origins (APIs, CDNs, analytics)
+4. Intercept APIs     →  see every endpoint the frontend calls, with payloads
+5. Inject JS          →  extract tokens, override functions, read JS-only state
+6. Execute            →  use real selectors from the map (precise, deterministic)
+7. Verify             →  diff the UI state before and after each action
 ```
 
 When any AI agent connects to Polaris it receives a full capability briefing automatically
@@ -129,7 +133,7 @@ MCP_TRANSPORT=streamable-http
 ### 6. Start the server
 
 ```bash
-./start_browser_python_mcp.sh
+./start.sh
 ```
 
 Or directly:
@@ -200,10 +204,17 @@ browser_map_site("https://app.example.com", session_file="/tmp/polaris_sessions/
 # 3. Deep-inspect a page to discover hidden dropdowns and modals
 browser_explore_page("https://app.example.com/dashboard", trigger_interactions=True)
 
-# 4. Map the API layer — discover every endpoint the page calls
-browser_intercept_network("https://app.example.com/dashboard")
+# 4. Find all external origins the page contacts (APIs, CDNs, analytics)
+browser_get_external_resources("https://app.example.com/dashboard")
+# → [{"hostname": "api.app.com", "category": "api", "count": 12, "urls": [...]}]
 
-# 5. Execute with real selectors from the map
+# 5. Map the API layer — discover every endpoint the page calls
+browser_intercept_network("https://app.example.com/dashboard", filter_url_contains="api.")
+
+# 6. Inject JS to extract data only visible in JS state
+browser_inject_js("JSON.stringify(window.__APP_CONFIG__)", url="https://app.example.com/dashboard")
+
+# 7. Execute with real selectors from the map
 browser_execute_sequence('[
   {"action": "goto", "url": "https://app.example.com/dashboard"},
   {"action": "click", "selector": "[data-qa=AddButton]"},
@@ -211,7 +222,7 @@ browser_execute_sequence('[
   {"action": "click", "selector": "[data-qa=SaveButton]"}
 ]', session_file="/tmp/polaris_sessions/myapp.json")
 
-# 6. Verify the UI changed as expected
+# 8. Verify the UI changed as expected
 browser_diff_pages(
   "https://app.example.com/dashboard",
   actions_code='await page.click("[data-qa=AddButton]")'
@@ -236,7 +247,16 @@ Returns: `{ requests_captured, entries: [{method, url, status, request_body, res
 **`browser_accessibility_tree`** — Full ARIA tree, flat + nested.
 Returns: `{ node_count, flat: [{depth, role, name}], tree }`
 
+**`browser_get_external_resources`** — All external URLs a page loads or links to.
+Combines static DOM scan + live network interception.
+Returns: `{ external_origin_count, external_origins: [{hostname, category, count, urls}] }`
+Categories: `analytics` · `cdn` · `api` · `font` · `social` · `ads` · `other`
+
 ### EXECUTION
+
+**`browser_inject_js`** — Evaluate JavaScript in the live page context.
+Returns the result (must be JSON-serializable). With `persistent=True` the script re-runs on every navigation via `addInitScript`.
+Use for: extracting split auth tokens from cookies, reading `window.__store__`, overriding `window.fetch`.
 
 **`browser_run_playwright`** — Execute Python Playwright code. Receives `page`, `context`, `asyncio`.
 Use `return {...}` to pass data back. Always use selectors from `browser_map_site`.
