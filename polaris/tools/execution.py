@@ -71,7 +71,7 @@ async def _run_steps(
 
                 if action == "click":
                     el = page.locator(sel)
-                    if step.get("index"):
+                    if step.get("index") is not None:
                         el = el.nth(step["index"])
                     await el.click(
                         force=step.get("force", False),
@@ -81,13 +81,18 @@ async def _run_steps(
                     sr["result"] = {"url": page.url}
                 elif action == "fill":
                     el = page.locator(sel)
+                    if step.get("index") is not None:
+                        el = el.nth(step["index"])
                     await el.wait_for(
                         state="visible", timeout=step.get("timeout", 10_000)
                     )
                     await el.clear()
                     await el.fill(step["value"])
                 elif action == "hover":
-                    await page.locator(sel).hover()
+                    el = page.locator(sel)
+                    if step.get("index") is not None:
+                        el = el.nth(step["index"])
+                    await el.hover()
 
             elif action == "select":
                 await page.locator(step["selector"]).select_option(step["value"])
