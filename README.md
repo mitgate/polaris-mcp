@@ -195,6 +195,190 @@ Add to your MCP settings:
 
 ---
 
+## Demos
+
+Real captures from Polaris running against public websites — no mocking, no staging.
+
+---
+
+### 1 — Loading and screenshotting any page
+
+Polaris opens a real Chromium browser (headless or visible), loads the page, and returns a
+base64 PNG. Call `browser_screenshot` with any URL:
+
+```python
+browser_screenshot("https://en.wikipedia.org/wiki/Python_(programming_language)")
+```
+
+![Wikipedia loaded by Polaris](assets/demo-wikipedia.png)
+
+> **_polaris telemetry**: `page_load_ms: 322`, `dom_ready_ms: 297`, `console_errors: 0`
+
+---
+
+### 2 — Mapping a site's full structure before writing automation
+
+`browser_map_site` crawls the site via BFS and returns every form, link, selector and
+interactive trigger. Here is a real crawl of [quotes.toscrape.com](https://quotes.toscrape.com):
+
+![quotes.toscrape.com loaded by Polaris](assets/demo-screenshot.png)
+
+```json
+// browser_map_site("https://quotes.toscrape.com/", max_pages=3)
+{
+  "pages_mapped": 3,
+  "pages": [
+    {
+      "url": "https://quotes.toscrape.com/",
+      "title": "Quotes to Scrape",
+      "navigation_links": ["/login", "/author/Albert-Einstein", "/tag/change/page/1/", "...46 more"],
+      "forms": [],
+      "interactive_triggers": []
+    },
+    {
+      "url": "https://quotes.toscrape.com/login",
+      "forms": [{
+        "inputs": [
+          {"name": "csrf_token", "type": "hidden"},
+          {"id": "username",     "type": "text"},
+          {"id": "password",     "type": "password"},
+          {"type": "submit"}
+        ]
+      }]
+    }
+  ],
+  "_polaris": {"duration_ms": 12984, "browser": {"console_errors": 0}}
+}
+```
+
+In 13 seconds Polaris discovered the login form, all navigation links, and the full site
+structure — without you writing a single selector.
+
+---
+
+### 3 — Auditing what a site sends to third parties
+
+`browser_get_external_resources` combines a static DOM scan with live network interception
+to reveal every external origin a page contacts. Here is BBC.com:
+
+```json
+// browser_get_external_resources("https://www.bbc.com/")
+{
+  "external_origin_count": 30,
+  "total_external_urls": 202,
+  "external_origins": [
+    {"hostname": "static.files.bbci.co.uk",       "category": "cdn",       "count": 90},
+    {"hostname": "ichef.bbci.co.uk",              "category": "cdn",       "count": 65},
+    {"hostname": "securepubads.g.doubleclick.net", "category": "ads",       "count": 4},
+    {"hostname": "cdn.cxense.com",                "category": "analytics", "count": 3},
+    {"hostname": "cdn.privacy-mgmt.com",          "category": "cdn",       "count": 3},
+    {"hostname": "uk-script.dotmetrics.net",      "category": "analytics", "count": 3},
+    {"hostname": "cdn.optimizely.com",            "category": "analytics", "count": 1},
+    {"hostname": "prebid.the-ozone-project.com",  "category": "ads",       "count": 5}
+  ]
+}
+```
+
+30 external origins, 202 external resources — DoubleClick ads, Optimizely A/B testing,
+Cxense analytics, Permutive audience segmentation, all visible in one call.
+
+---
+
+### 4 — Extracting structured data via JavaScript injection
+
+`browser_inject_js` runs arbitrary JavaScript inside the live page and returns the result.
+No HTML scraping needed — read directly from the DOM or JS state:
+
+```python
+browser_inject_js("""
+    (() => {
+        const infobox = {};
+        document.querySelectorAll('.infobox tr').forEach(row => {
+            const label = row.querySelector('th')?.innerText?.trim();
+            const value = row.querySelector('td')?.innerText?.trim();
+            if (label && value) infobox[label] = value;
+        });
+        return {
+            title: document.querySelector('h1')?.innerText,
+            first_paragraph: document.querySelector('.mw-parser-output > p')?.innerText?.slice(0, 200),
+            infobox: infobox,
+        };
+    })()
+""", url="https://en.wikipedia.org/wiki/Python_(programming_language)")
+```
+
+```json
+{
+  "result": {
+    "title": "Python (programming language)",
+    "first_paragraph": "Python is a high-level, general-purpose programming language that emphasizes code readability...",
+    "infobox": {
+      "Paradigm":       "Multi-paradigm: object-oriented, procedural, functional, structured",
+      "Designed by":    "Guido van Rossum",
+      "Developer":      "Python Software Foundation",
+      "First appeared": "20 February 1991; 35 years ago",
+      "Stable release": "3.14.6 / 10 June 2026"
+    }
+  },
+  "_polaris": {"duration_ms": 3661, "browser": {"console_errors": 0}}
+}
+```
+
+---
+
+### 5 — Goal-driven automation: browser_auto_sequence
+
+Give Polaris a goal in plain English. It maps the page, explores hidden triggers,
+asks an LLM to generate the optimal step sequence using the map as context, and executes.
+
+```python
+# Login to quotes.toscrape.com — Polaris discovers the form, generates the steps, executes
+browser_auto_sequence(
+    goal="Log in with username 'admin' and password 'admin', then navigate to the main page",
+    url="https://quotes.toscrape.com/login",
+)
+```
+
+```json
+{
+  "goal": "Log in with username 'admin' and password 'admin', then navigate to the main page",
+  "generated_steps": [
+    {"action": "fill",    "selector": "#username", "value": "admin"},
+    {"action": "fill",    "selector": "#password", "value": "admin"},
+    {"action": "click",   "selector": "input[type=submit]", "wait_after": 2.0},
+    {"action": "wait_for","seconds": 2},
+    {"action": "snapshot"}
+  ],
+  "execution": {
+    "steps_total": 5,
+    "steps_succeeded": 5,
+    "final_url": "https://quotes.toscrape.com/",
+    "results": [
+      {"step": 1, "action": "fill",     "success": true, "duration_ms": 312},
+      {"step": 2, "action": "fill",     "success": true, "duration_ms": 198},
+      {"step": 3, "action": "click",    "success": true, "duration_ms": 2145},
+      {"step": 4, "action": "wait_for", "success": true, "duration_ms": 2001},
+      {"step": 5, "action": "snapshot", "success": true, "duration_ms": 87}
+    ]
+  }
+}
+```
+
+The LLM never touched the browser directly. It received the site map, wrote the steps,
+and Polaris executed them deterministically. No hallucinated selectors, no retries.
+
+---
+
+### 6 — The login form discovered, filled, and submitted
+
+![Login form discovered by browser_map_site](assets/demo-login-form.png)
+
+Every field (`#username`, `#password`, `input[type=submit]`) was discovered by
+`browser_map_site` — the form structure above is real data from the crawl, not
+guesswork.
+
+---
+
 ## Quick Start Example
 
 ```python
