@@ -23,6 +23,7 @@ EXECUTION   → act with real selectors
   browser_inject_js           Inject and run JavaScript; returns the result
   browser_run_playwright      Run Python Playwright code directly (no LLM in the loop)
   browser_execute_sequence    Typed JSON action sequence: goto / click / fill / wait_for / ...
+  browser_auto_sequence       Map First in one call: map → explore → LLM plans → execute
   browser_run_task            LLM-driven natural language automation (fallback / exploration)
 
 VERIFICATION → confirm what happened
@@ -54,6 +55,9 @@ UTILITIES
 5. Inject JS          →  extract tokens, override functions, read JS-only state
 6. Execute            →  use real selectors from the map (precise, deterministic)
 7. Verify             →  diff the UI state before and after each action
+
+Shortcut (steps 1–6 in one call):
+  browser_auto_sequence("your goal", url) → maps, explores, plans via LLM, executes
 ```
 
 When any AI agent connects to Polaris it receives a full capability briefing automatically
@@ -263,6 +267,11 @@ Use `return {...}` to pass data back. Always use selectors from `browser_map_sit
 
 **`browser_execute_sequence`** — Typed JSON action sequence.
 Actions: `goto` · `click` · `fill` · `select` · `press` · `hover` · `scroll` · `wait_for` · `snapshot` · `screenshot` · `evaluate`
+
+**`browser_auto_sequence`** — Map First em uma única chamada.
+Mapeia a página, explora triggers, gera sequência via LLM e executa.
+Com `dry_run=True` retorna apenas os steps sem executar.
+Returns: `{ goal, generated_steps, execution: { steps_succeeded, final_url, results } }`
 
 **`browser_run_task`** — Natural language task via an LLM agent (browser-use).
 Fallback for unstructured exploration when selectors are not yet known.
